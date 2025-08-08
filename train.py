@@ -4,6 +4,7 @@
 from torchvision.transforms import RandomCrop, Compose, ToPILImage, Resize, ToTensor, Lambda
 from diffusion_model.trainer import GaussianDiffusion, Trainer
 from diffusion_model.unet import create_model
+#from dataset_wavelet import CTImageGenerator, CTPairImageGenerator, create_train_val_test_datasets
 from dataset import CTImageGenerator, CTPairImageGenerator, create_train_val_test_datasets
 import argparse
 import torch
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # -
 
 parser = argparse.ArgumentParser()
@@ -69,6 +70,33 @@ beta_schedule = args.beta_schedule
 gradient_accumulate_every = args.gradient_accumulate_every
 
 # Create validation results directory
+def ask_and_clear_dir(path, description):
+    """
+    Ask user if they want to clear the given directory.
+    """
+    if os.path.exists(path) and os.listdir(path):
+        while True:
+            response = input(f"The {description} '{path}' is not empty. Do you want to clear it? (y/n): ").lower().strip()
+            if response in ['y', 'yes']:
+                import shutil
+                shutil.rmtree(path)
+                os.makedirs(path, exist_ok=True)
+                print(f"✅ Cleared {description}: {path}")
+                break
+            elif response in ['n', 'no']:
+                print(f"ℹ️ Keeping existing contents in {description}: {path}")
+                break
+            else:
+                print("Please enter 'y' or 'n'.")
+    else:
+        os.makedirs(path, exist_ok=True)
+        print(f"✅ Created empty {description}: {path}")
+# Ask user to clear paths at the start of training
+ask_and_clear_dir(args.val_results_dir, "validation results folder")
+ask_and_clear_dir(args.test_results_dir, "test results folder")
+ask_and_clear_dir(args.images_dir, "images folder")
+
+'''
 def clear_val_results_folder(val_results_dir):
     """Ask user if they want to clear the validation results folder"""
     if os.path.exists(val_results_dir) and os.listdir(val_results_dir):
@@ -105,7 +133,8 @@ def clear_results_folder(results_dir):
 clear_val_results_folder(val_results_dir)
 os.makedirs(val_results_dir, exist_ok=True)
 os.makedirs(images_dir, exist_ok=True)
-
+'''
+'''
 # Enhanced transforms for low-contrast CT scans
 def enhance_ct_contrast(tensor):
     """Enhanced contrast for low-contrast CT scans"""
@@ -116,14 +145,33 @@ def enhance_ct_contrast(tensor):
         return tensor
     tensor = torch.clamp((tensor - p5) / (p95 - p5 + 1e-8), 0, 1)
     return tensor
+'''
+
+def enhance_ct_contrast(tensor, low=5, high=95):
+    """
+    Enhance CT contrast using percentile-based stretching.
+    :param tensor: Input tensor [0,1].
+    :param low: Lower percentile (e.g., 2).
+    :param high: Upper percentile (e.g., 98).
+    """
+    tensor_flat = tensor.flatten()
+    p_low = torch.quantile(tensor_flat, low / 100.0)
+    p_high = torch.quantile(tensor_flat, high / 100.0)
+
+    if p_high - p_low < 1e-6:  # Avoid division by zero
+        return tensor
+
+    tensor = torch.clamp((tensor - p_low) / (p_high - p_low + 1e-8), 0, 1)
+    return tensor
 
 # Updated transforms with CT enhancement
 transform = Compose([
     Lambda(lambda t: torch.tensor(t).float()),
-    Lambda(lambda t: (t / 127.5) - 1.0),  # Direct: [0,255] → [-1,1]
-    #Lambda(lambda t: t / 255.0),  # [0,255] -> [0,1]
+    #Lambda(lambda t: (t / 127.5) - 1.0),  # Direct: [0,255] → [-1,1]
+    Lambda(lambda t: t / 255.0),  # [0,255] -> [0,1]
     #Lambda(enhance_ct_contrast),   # ✅ CRITICAL: Enhance CT contrast
-    #Lambda(lambda t: (t * 2) - 1),  # [0,1] -> [-1,1]
+    Lambda(lambda t: enhance_ct_contrast(t, low=2, high=98)),  # Use 2–98 percentile
+    Lambda(lambda t: (t * 2) - 1),  # [0,1] -> [-1,1]
     Lambda(lambda t: t.unsqueeze(0) if len(t.shape) == 2 else t),
 ])
 
@@ -333,8 +381,8 @@ def calculate_ssim(real_images, generated_images):
 def test_model(diffusion_model, test_dataset, test_results_dir, with_condition=True):
     """Test the trained model and save results with FID/SSIM metrics"""
     
-    clear_results_folder(test_results_dir)
-    os.makedirs(test_results_dir, exist_ok=True)
+    #clear_results_folder(test_results_dir)
+    #os.makedirs(test_results_dir, exist_ok=True)
     
     print(f"\n🧪 TESTING MODEL ON {len(test_dataset)} TEST SAMPLES")
     print("=" * 60)
@@ -670,7 +718,7 @@ trainer = CTTrainer(
 
 trainer.train()
 
-ema_ckpt_path = os.path.join('./result', 'ema_model_final.pth')
+ema_ckpt_path = os.path.join('/home/li46460/wdm_ddpm/original/results', 'ema_model_final.pth')
 torch.save(trainer.ema_model.state_dict(), ema_ckpt_path)
 print(f"✅ EMA weights saved to {ema_ckpt_path}")
 
