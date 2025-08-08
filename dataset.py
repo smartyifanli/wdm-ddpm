@@ -191,7 +191,7 @@ class CTPairImageGenerator(Dataset):
 
         return {'input': input_img, 'target': target_img}
 
-
+'''
 def create_train_val_test_datasets(dataset, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, random_state=42):
     """
     Split dataset into train/val/test with 7:1:2 ratio
@@ -216,6 +216,109 @@ def create_train_val_test_datasets(dataset, train_ratio=0.7, val_ratio=0.1, test
     val_dataset = Subset(dataset, val_indices)
     test_dataset = Subset(dataset, test_indices)
     
+    print(f"Dataset split - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    
+    return train_dataset, val_dataset, test_dataset
+'''
+def create_train_val_test_datasets(dataset, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, random_state=42):
+    """
+    Split dataset into train/val/test with 7:1:2 ratio
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+    
+    total_size = len(dataset)
+    indices = list(range(total_size))
+    
+    # First split: separate test set
+    train_val_indices, test_indices = train_test_split(
+        indices, test_size=test_ratio, random_state=random_state
+    )
+    
+    # Second split: separate train and val from remaining data
+    val_ratio_adjusted = val_ratio / (train_ratio + val_ratio)
+    train_indices, val_indices = train_test_split(
+        train_val_indices, test_size=val_ratio_adjusted, random_state=random_state
+    )
+    
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    test_dataset = Subset(dataset, test_indices)
+    
+    print(f"Dataset split - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    
+    return train_dataset, val_dataset, test_dataset
+
+
+def create_train_val_test_datasets_by_subject(dataset, test_subjects, train_val_ratio=0.8, random_state=42):
+    """
+    Split dataset by subjects: specified subjects for test, rest split into train/val
+    
+    Args:
+        dataset: CTPairImageGenerator dataset
+        test_subjects: list of subject IDs to use for testing (e.g., ['subject_1767', 'subject_3741'])
+        train_val_ratio: ratio of train vs val from remaining subjects (0.8 = 80% train, 20% val)
+        random_state: random seed for reproducibility
+    """
+    # Group indices by subject
+    subject_indices = {}
+    test_indices = []
+    train_val_indices = []
+    
+    for i, (label_file, scan_file) in enumerate(dataset.pair_files):
+        # Extract subject ID from filename
+        # Format: subject_1767_slice_188_label.png
+        basename = os.path.basename(label_file)
+        match = re.search(r'(subject_\d+)_slice_\d+_label\.png', basename)
+        
+        if match:
+            subject_id = match.group(1)
+            
+            if subject_id not in subject_indices:
+                subject_indices[subject_id] = []
+            subject_indices[subject_id].append(i)
+            
+            # Separate test subjects from train/val subjects
+            if subject_id in test_subjects:
+                test_indices.append(i)
+            else:
+                train_val_indices.append(i)
+        else:
+            print(f"Warning: Could not parse subject ID from {basename}")
+            # If we can't parse, add to train_val by default
+            train_val_indices.append(i)
+    
+    # Split remaining subjects into train and val
+    if len(train_val_indices) > 0:
+        train_indices, val_indices = train_test_split(
+            train_val_indices, 
+            train_size=train_val_ratio, 
+            random_state=random_state
+        )
+    else:
+        train_indices, val_indices = [], []
+    
+    # Create subset datasets
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    test_dataset = Subset(dataset, test_indices)
+    
+    # Print detailed split information
+    print(f"\n📊 DATASET SPLIT BY SUBJECT:")
+    print(f"Total subjects found: {len(subject_indices)}")
+    print(f"Test subjects: {test_subjects}")
+    
+    # Count slices per subject
+    test_subject_counts = {}
+    train_val_subjects = []
+    
+    for subject_id, indices in subject_indices.items():
+        if subject_id in test_subjects:
+            test_subject_counts[subject_id] = len(indices)
+        else:
+            train_val_subjects.append(f"{subject_id}({len(indices)} slices)")
+    
+    print(f"Test subject slice counts: {test_subject_counts}")
+    print(f"Train/Val subjects: {train_val_subjects[:5]}{'...' if len(train_val_subjects) > 5 else ''}")
     print(f"Dataset split - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
     
     return train_dataset, val_dataset, test_dataset
