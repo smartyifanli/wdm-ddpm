@@ -5,12 +5,13 @@ from torchvision.transforms import RandomCrop, Compose, ToPILImage, Resize, ToTe
 from diffusion_model.trainer import GaussianDiffusion, Trainer
 from diffusion_model.unet import create_model
 #from dataset_wavelet import CTImageGenerator, CTPairImageGenerator, create_train_val_test_datasets
-from dataset import CTImageGenerator, CTPairImageGenerator, create_train_val_test_datasets
+from dataset import CTImageGenerator, CTPairImageGenerator, create_train_val_datasets_9_1_split
 import argparse
 import torch
 import os
 import numpy as np
 from PIL import Image
+from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import json
@@ -22,8 +23,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # -
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-l', '--labelfolder', type=str, default="../crop/labels/")
-parser.add_argument('-s', '--scanfolder', type=str, default="../crop/scans/")
+#parser.add_argument('-l', '--labelfolder', type=str, default="../crop/labels/")
+#parser.add_argument('-s', '--scanfolder', type=str, default="../crop/scans/")
+parser.add_argument('-d', '--data_root', type=str, default="/storage/data/TRAIL_Yifan/MH/")
 parser.add_argument('--input_size', type=int, default=512)  # Changed to 512 to preserve original size
 parser.add_argument('--num_channels', type=int, default=64)
 parser.add_argument('--num_res_blocks', type=int, default=1)
@@ -49,8 +51,9 @@ parser.add_argument('--gradient_accumulate_every', type=int, default=2, help='Gr
 
 args = parser.parse_args()
 
-labelfolder = args.labelfolder
-scanfolder = args.scanfolder
+#labelfolder = args.labelfolder
+#scanfolder = args.scanfolder
+data_root = args.data_root
 input_size = args.input_size
 num_channels = args.num_channels
 num_res_blocks = args.num_res_blocks
@@ -186,8 +189,9 @@ input_transform = Compose([
 
 if with_condition:
     full_dataset = CTPairImageGenerator(
-        labelfolder,
-        scanfolder,
+        #labelfolder,
+        #scanfolder,
+        data_root,
         input_size=input_size,
         input_channel=num_class_labels,
         transform=input_transform,
@@ -222,12 +226,13 @@ if with_condition:
             print("  ⚠️  WARNING: Target data is very sparse!")
     
     # Split into train/val/test with 7:1:2 ratio and save indices
-    train_dataset, val_dataset, test_dataset = create_train_val_test_datasets(
-        full_dataset, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2
+    train_dataset, val_dataset, test_dataset, train_subjects, val_subjects = create_train_val_datasets_9_1_split(
+        full_dataset, 
+        random_state=42
     )
     
     # Save test indices for reproducible testing
-    test_indices = test_dataset.indices if hasattr(test_dataset, 'indices') else list(range(len(test_dataset)))
+    test_indices = list(range(len(full_dataset)))  # All indices since test = whole dataset
     indices_file = os.path.join(images_dir, 'test_indices.json')
     with open(indices_file, 'w') as f:
         json.dump({
@@ -239,18 +244,25 @@ if with_condition:
     
 else:
     full_dataset = CTImageGenerator(
-        scanfolder,  # Use scan folder for unconditional generation
+        data_root,
         input_size=input_size,
         transform=transform
     )
     
-    # Split into train/val/test and save indices
-    train_dataset, val_dataset, test_dataset = create_train_val_test_datasets(
-        full_dataset, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2
+    # Use simple splitting for unconditional (9:1 train:val, all as test)
+    all_indices = list(range(len(full_dataset)))
+    train_indices, val_indices = train_test_split(
+        all_indices, train_size=0.9, random_state=42
     )
     
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices) 
+    test_dataset = full_dataset  # Whole dataset as test
+    train_subjects = ["unconditional_train"]
+    val_subjects = ["unconditional_val"]
+
     # Save test indices
-    test_indices = test_dataset.indices if hasattr(test_dataset, 'indices') else list(range(len(test_dataset)))
+    test_indices = list(range(len(full_dataset)))  # All indices since test = whole dataset
     indices_file = os.path.join(images_dir, 'test_indices.json')
     with open(indices_file, 'w') as f:
         json.dump({
@@ -304,10 +316,11 @@ diffusion = GaussianDiffusion(
     # Note: beta_schedule not supported by this GaussianDiffusion implementation
 ).cuda()
 
-if len(resume_weight) > 0 and os.path.exists(resume_weight):
-    weight = torch.load(resume_weight, map_location='cuda')
-    diffusion.load_state_dict(weight['ema'])
-    print("Model Loaded!")
+#if len(resume_weight) > 0 and os.path.exists(resume_weight):
+#    weight = torch.load(resume_weight, map_location='cuda')
+#    diffusion.load_state_dict(weight['ema'])
+#    print("Model Loaded!")
+
 
 def loss_backwards(fp16, loss, optimizer, **kwargs):
     """Handle backward pass with optional mixed precision"""
@@ -377,7 +390,168 @@ def calculate_ssim(real_images, generated_images):
         print("scikit-image not available. Install with: pip install scikit-image")
         return 0.0
 
+def save_generation_organized(generated_img, original_dataset, test_index, data_root):
+    """
+    Save generated image in organized folder structure
+    Args:
+        generated_img: The generated image tensor/array
+        original_dataset: The full dataset to get file paths
+        test_index: Index in the original dataset (not subset)
+        data_root: Root data directory
+    """
+    try:
+        # Get original file paths
+        mask_file, ct_file = original_dataset.pair_files[test_index]
+        
+        # Extract subject_id and slice_id from ct_file path
+        # ct_file example: "/storage/data/TRAIL_Yifan/MH/2171/positive/ct/2171_170.png"
+        ct_filename = os.path.basename(ct_file)  # "2171_170.png"
+        
+        # Extract subject_id and slice_id using regex
+        import re
+        match = re.search(r'(\d+)_(\d+)\.png$', ct_filename)
+        if not match:
+            print(f"⚠️ Could not parse filename: {ct_filename}")
+            return False
+            
+        subject_id = match.group(1)  # "2171"
+        slice_id = match.group(2)    # "170"
+        
+        # Create generation folder path
+        generation_folder = os.path.join(data_root, subject_id, "positive", "generation")
+        os.makedirs(generation_folder, exist_ok=True)
+        
+        # Create output filename with same naming convention
+        output_filename = f"{subject_id}_{slice_id}.png"
+        output_path = os.path.join(generation_folder, output_filename)
+        
+        # Save the generated image
+        save_image_png(generated_img, output_path)
+        
+        print(f"✅ Saved: {subject_id}/positive/generation/{output_filename}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error saving organized generation for index {test_index}: {e}")
+        return False
+    
 
+def test_model(diffusion_model, test_dataset, test_results_dir, full_dataset, data_root, with_condition=True):
+    """
+    Test the trained model and save results in organized folders
+    
+    Args:
+        diffusion_model: The trained diffusion model
+        test_dataset: Test dataset (might be Subset)
+        test_results_dir: Directory for test results (keeping for metrics)
+        full_dataset: Original full dataset to access file paths
+        data_root: Root data directory for organized saving
+        with_condition: Whether using conditional generation
+    """
+    
+    print(f"\n🧪 TESTING MODEL ON {len(test_dataset)} TEST SAMPLES")
+    print("=" * 60)
+    
+    all_real_images = []
+    all_generated_images = []
+    saved_count = 0
+    
+    diffusion_model.eval()
+    
+    with torch.no_grad():
+        for i in range(min(len(test_dataset), 50)):  # Test on first 50 samples
+            if i % 10 == 0:
+                print(f"Testing sample {i+1}/{min(len(test_dataset), 50)}...")
+            
+            try:
+                if with_condition:
+                    test_data = test_dataset[i]
+                    input_tensor = test_data['input'].unsqueeze(0).cuda()
+                    target_tensor = test_data['target'].unsqueeze(0).cuda()
+                    
+                    # Generate sample
+                    generated = diffusion_model.sample(batch_size=1, condition_tensors=input_tensor)
+                    
+                    # 🆕 Get original dataset index (handle Subset case)
+                    if hasattr(test_dataset, 'indices'):
+                        # test_dataset is a Subset
+                        original_index = test_dataset.indices[i]
+                    else:
+                        # test_dataset is the full dataset
+                        original_index = i
+                    
+                    # 🆕 Save in organized folder structure
+                    success = save_generation_organized(
+                        generated[0].cpu().numpy(), 
+                        full_dataset, 
+                        original_index, 
+                        data_root
+                    )
+                    
+                    if success:
+                        saved_count += 1
+                    
+                    # 🆕 OPTIONAL: Still save in test_results_dir for metrics/comparison
+                    # (You can remove this section if you don't want duplicate saves)
+                    save_image_png(input_tensor[0].cpu().numpy(), 
+                                  os.path.join(test_results_dir, f"test_{i:03d}_input.png"),
+                                  is_input_label=True)
+                    save_image_png(target_tensor[0].cpu().numpy(), 
+                                  os.path.join(test_results_dir, f"test_{i:03d}_target.png"))
+                    save_image_png(generated[0].cpu().numpy(), 
+                                  os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
+                    
+                    # Collect for metrics
+                    all_real_images.append(target_tensor[0])
+                    all_generated_images.append(generated[0])
+                    
+                else:
+                    # Unconditional generation - save in test_results_dir only
+                    generated = diffusion_model.sample(batch_size=1)
+                    save_image_png(generated[0].cpu().numpy(), 
+                                  os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
+                    
+            except Exception as e:
+                print(f"Error testing sample {i}: {e}")
+                continue
+    
+    print(f"✅ Saved {saved_count} generations in organized folder structure")
+    
+    if with_condition and all_real_images:
+        # Calculate metrics
+        real_images_tensor = torch.stack(all_real_images)
+        generated_images_tensor = torch.stack(all_generated_images)
+        
+        print(f"\n📊 CALCULATING METRICS...")
+        fid_score = calculate_fid(real_images_tensor, generated_images_tensor)
+        ssim_score = calculate_ssim(real_images_tensor, generated_images_tensor)
+        
+        print(f"📈 TEST RESULTS:")
+        print(f"   FID Score: {fid_score:.4f}")
+        print(f"   SSIM Score: {ssim_score:.4f}")
+        print(f"   Test samples: {len(all_real_images)}")
+        print(f"   Organized saves: {saved_count}")
+        
+        # Save metrics
+        metrics = {
+            'fid_score': float(fid_score),
+            'ssim_score': float(ssim_score),
+            'num_test_samples': len(all_real_images),
+            'organized_saves': saved_count,
+            'test_date': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        with open(os.path.join(test_results_dir, 'metrics.json'), 'w') as f:
+            json.dump(metrics, f, indent=2)
+        
+        print(f"✅ Test results saved to: {test_results_dir}")
+        print(f"✅ Metrics saved to: {os.path.join(test_results_dir, 'metrics.json')}")
+        print(f"✅ Organized generations saved in: {data_root}/{{subject_id}}/positive/generation/")
+        
+        return fid_score, ssim_score
+    
+    return 0.0, 0.0
+'''
 def test_model(diffusion_model, test_dataset, test_results_dir, with_condition=True):
     """Test the trained model and save results with FID/SSIM metrics"""
     
@@ -461,7 +635,7 @@ def test_model(diffusion_model, test_dataset, test_results_dir, with_condition=T
     
     return 0.0, 0.0
 
-
+'''
 
 
 def save_image_png(img_array, filepath, add_stats=False, is_input_label=False):
@@ -718,6 +892,21 @@ trainer = CTTrainer(
 
 trainer.train()
 
+if len(resume_weight) > 0 and os.path.exists(resume_weight):
+    if resume_weight.endswith("ema_model_final.pth"):
+        diffusion.load_state_dict(torch.load(resume_weight))
+        print("✅ EMA model loaded for inference")
+    else:
+        ckpt = torch.load(resume_weight, map_location='cuda')
+        trainer.step = ckpt['step']
+        trainer.model.load_state_dict(ckpt['model'])
+        trainer.ema_model.load_state_dict(ckpt['ema'])
+        if 'optimizer' in ckpt:
+            Trainer.opt.load_state_dict(ckpt['optimizer'])  # ✅ Load optimizer state
+            print("✅ Optimizer state loaded")
+        print(f"✅ Training resumed from step {trainer.step}")
+
+
 ema_ckpt_path = os.path.join('/home/li46460/wdm_ddpm/original/results', 'ema_model_final.pth')
 torch.save(trainer.ema_model.state_dict(), ema_ckpt_path)
 print(f"✅ EMA weights saved to {ema_ckpt_path}")
@@ -726,7 +915,8 @@ print(f"✅ EMA weights saved to {ema_ckpt_path}")
 if run_test_after_training:
     print(f"\n🧪 RUNNING TEST EVALUATION...")
     #test_model(diffusion, test_dataset, test_results_dir, with_condition)
-    test_model(trainer.ema_model, test_dataset, test_results_dir, with_condition)
+    #test_model(trainer.ema_model, test_dataset, test_results_dir, with_condition)
+    test_model(trainer.ema_model, test_dataset, test_results_dir, full_dataset, data_root, with_condition)
 else:
     print(f"\n💡 To run test evaluation, use: --run_test_after_training")
     print(f"   Test indices are saved in: {os.path.join(images_dir, 'test_indices.json')}")
