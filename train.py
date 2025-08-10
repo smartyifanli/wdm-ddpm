@@ -921,3 +921,4 @@ else:
     print(f"\n💡 To run test evaluation, use: --run_test_after_training")
     print(f"   Test indices are saved in: {os.path.join(images_dir, 'test_indices.json')}")
     print(f"   You can run testing later using the saved indices.")
+    print(f"   You can run testing later using the saved indices.")
