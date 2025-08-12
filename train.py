@@ -5,7 +5,8 @@ from torchvision.transforms import RandomCrop, Compose, ToPILImage, Resize, ToTe
 from diffusion_model.trainer import GaussianDiffusion, Trainer
 from diffusion_model.unet import create_model
 #from dataset_wavelet import CTImageGenerator, CTPairImageGenerator, create_train_val_test_datasets
-from dataset import CTImageGenerator, CTPairImageGenerator, create_train_val_datasets_9_1_split
+from dataset import CTImageGenerator, CTPairImageGenerator
+from dataset import Wavelet2DDataset, create_train_val_datasets_9_1_split_wavelet
 import argparse
 import torch
 import os
@@ -17,9 +18,12 @@ from sklearn.model_selection import train_test_split
 import json
 import time
 from pathlib import Path
+from diffusion_model.trainer import idwt_haar_1level
+from torchvision.utils import save_image
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 # -
 
 parser = argparse.ArgumentParser()
@@ -32,14 +36,14 @@ parser.add_argument('--num_res_blocks', type=int, default=1)
 parser.add_argument('--num_class_labels', type=int, default=1)  # Changed from 3 to 1 for CT
 parser.add_argument('--train_lr', type=float, default=1e-5)
 parser.add_argument('--batchsize', type=int, default=1)  # Reduced to 1 for 512x512 images
-parser.add_argument('--epochs', type=int, default=50000)
+parser.add_argument('--epochs', type=int, default=10000)
 parser.add_argument('--timesteps', type=int, default=1000)  # Updated from 250 to 1000
 parser.add_argument('--save_and_sample_every', type=int, default=100)  # Changed to 100 epochs
 parser.add_argument('--with_condition', action='store_true')
 parser.add_argument('-r', '--resume_weight', type=str, default="")
-parser.add_argument('--val_results_dir', type=str, default="/home/li46460/wdm_ddpm/original/val_results")
-parser.add_argument('--test_results_dir', type=str, default="/home/li46460/wdm_ddpm/original/results")
-parser.add_argument('--images_dir', type=str, default="/home/li46460/wdm_ddpm/original/images")
+parser.add_argument('--val_results_dir', type=str, default="/storage/data/li46460_wdm_ddpm/wdm-ddpm/val_results")
+parser.add_argument('--test_results_dir', type=str, default="/storage/data/li46460_wdm_ddpm/wdm-ddpm/results")
+parser.add_argument('--images_dir', type=str, default="/storage/data/li46460_wdm_ddpm/wdm-ddpm/images")
 parser.add_argument('--run_test_after_training', action='store_true', help='Run test evaluation after training')
 
 # ✅ ADD these new advanced parameters
@@ -48,6 +52,9 @@ parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay r
 parser.add_argument('--gradient_clip_val', type=float, default=1.0, help='Gradient clipping value')
 parser.add_argument('--beta_schedule', type=str, default='cosine', choices=['linear', 'cosine'], help='Noise schedule')
 parser.add_argument('--gradient_accumulate_every', type=int, default=2, help='Gradient accumulation steps')
+parser.add_argument('--band_weights', type=str, default='3.0,0.25,0.25,0.25',
+                    help='Comma-separated weights for [LL,LH,HL,HH] in loss')
+
 
 args = parser.parse_args()
 
@@ -99,138 +106,82 @@ ask_and_clear_dir(args.val_results_dir, "validation results folder")
 ask_and_clear_dir(args.test_results_dir, "test results folder")
 ask_and_clear_dir(args.images_dir, "images folder")
 
-'''
-def clear_val_results_folder(val_results_dir):
-    """Ask user if they want to clear the validation results folder"""
-    if os.path.exists(val_results_dir) and os.listdir(val_results_dir):
-        while True:
-            response = input(f"The folder '{val_results_dir}' already exists and is not empty. Do you want to clear it? (y/n): ").lower().strip()
-            if response in ['y', 'yes']:
-                import shutil
-                shutil.rmtree(val_results_dir)
-                print(f"Cleared folder: {val_results_dir}")
-                break
-            elif response in ['n', 'no']:
-                print("Keeping existing folder contents.")
-                break
-            else:
-                print("Please enter 'y' for yes or 'n' for no.")
-
-def clear_results_folder(results_dir):
-    """Ask user if they want to clear the results folder"""
-    if os.path.exists(results_dir) and os.listdir(results_dir):
-        while True:
-            response = input(f"The folder '{results_dir}' already exists and is not empty. Do you want to clear it? (y/n): ").lower().strip()
-            if response in ['y', 'yes']:
-                import shutil
-                shutil.rmtree(results_dir)
-                print(f"Cleared folder: {results_dir}")
-                break
-            elif response in ['n', 'no']:
-                print("Keeping existing folder contents.")
-                break
-            else:
-                print("Please enter 'y' for yes or 'n' for no.")
-
-# Create directories
-clear_val_results_folder(val_results_dir)
-os.makedirs(val_results_dir, exist_ok=True)
-os.makedirs(images_dir, exist_ok=True)
-'''
-'''
-# Enhanced transforms for low-contrast CT scans
-def enhance_ct_contrast(tensor):
-    """Enhanced contrast for low-contrast CT scans"""
-    tensor_flat = tensor.flatten()
-    # Use percentile-based normalization to stretch contrast
-    p5, p95 = torch.quantile(tensor_flat, 0.05), torch.quantile(tensor_flat, 0.95)
-    if p95 - p5 < 1e-6:  # Avoid division by zero
-        return tensor
-    tensor = torch.clamp((tensor - p5) / (p95 - p5 + 1e-8), 0, 1)
-    return tensor
-'''
-
-def enhance_ct_contrast(tensor, low=5, high=95):
-    """
-    Enhance CT contrast using percentile-based stretching.
-    :param tensor: Input tensor [0,1].
-    :param low: Lower percentile (e.g., 2).
-    :param high: Upper percentile (e.g., 98).
-    """
-    tensor_flat = tensor.flatten()
-    p_low = torch.quantile(tensor_flat, low / 100.0)
-    p_high = torch.quantile(tensor_flat, high / 100.0)
-
-    if p_high - p_low < 1e-6:  # Avoid division by zero
-        return tensor
-
-    tensor = torch.clamp((tensor - p_low) / (p_high - p_low + 1e-8), 0, 1)
-    return tensor
-
-# Updated transforms with CT enhancement
-transform = Compose([
-    Lambda(lambda t: torch.tensor(t).float()),
-    #Lambda(lambda t: (t / 127.5) - 1.0),  # Direct: [0,255] → [-1,1]
-    Lambda(lambda t: t / 255.0),  # [0,255] -> [0,1]
-    #Lambda(enhance_ct_contrast),   # ✅ CRITICAL: Enhance CT contrast
-    Lambda(lambda t: enhance_ct_contrast(t, low=2, high=98)),  # Use 2–98 percentile
-    Lambda(lambda t: (t * 2) - 1),  # [0,1] -> [-1,1]
-    Lambda(lambda t: t.unsqueeze(0) if len(t.shape) == 2 else t),
-])
-
-# Keep input transform simple for labels (they're already binary)
-input_transform = Compose([
-    Lambda(lambda t: torch.tensor(t).float()),
-    Lambda(lambda t: (t / 127.5) - 1.0),
-    #Lambda(lambda t: t / 255.0),  # [0,255] -> [0,1]
-    #Lambda(lambda t: (t * 2) - 1),  # [0,1] -> [-1,1]
-    Lambda(lambda t: t.unsqueeze(0) if len(t.shape) == 2 else t),
-])
 
 if with_condition:
-    full_dataset = CTPairImageGenerator(
-        #labelfolder,
-        #scanfolder,
-        data_root,
+    full_dataset = Wavelet2DDataset(
+        data_root=data_root,
         input_size=input_size,
-        input_channel=num_class_labels,
-        transform=input_transform,
-        target_transform=transform,
-        full_channel_mask=False  # Set to False for single channel CT
+        with_condition=with_condition,
+        standardize=False,
+        clip_mode='none',   # or 'soft'
+        clip_k=6.0,
+        soft_a=4.0
     )
-    
+
+
+
     # Debug: Check first sample
     print("🔍 DEBUGGING FIRST SAMPLE:")
+    # 🔍 DEBUGGING FIRST SAMPLE:
     if len(full_dataset) > 0:
-        sample = full_dataset[0]
-        print(f"  Input shape: {sample['input'].shape}")
-        print(f"  Input range: [{sample['input'].min():.4f}, {sample['input'].max():.4f}]")
-        print(f"  Input mean: {sample['input'].mean():.4f}")
-        print(f"  Input std: {sample['input'].std():.4f}")
-        print(f"  Target shape: {sample['target'].shape}")  
-        print(f"  Target range: [{sample['target'].min():.4f}, {sample['target'].max():.4f}]")
-        print(f"  Target mean: {sample['target'].mean():.4f}")
-        print(f"  Target std: {sample['target'].std():.4f}")
-        
-        # Check for sparse data
-        input_positive = torch.sum(sample['input'] > -0.5).item()
-        target_positive = torch.sum(sample['target'] > -0.5).item()
-        total_pixels = sample['input'].numel()
-        
+        cond, coeffs = full_dataset[0]          # cond:[1,H/2,W/2], coeffs:[4,H/2,W/2]
+        print(f"  Input (mask) shape: {cond.shape}  range=[{cond.min():.4f}, {cond.max():.4f}]  mean={cond.mean():.4f}  std={cond.std():.4f}")
+        print(f"  Target (coeffs) shape: {coeffs.shape}  range=[{coeffs.min():.4f}, {coeffs.max():.4f}]  mean={coeffs.mean():.4f}  std={coeffs.std():.4f}")
+
+        # Simple sparsity-ish checks (mask is −1/1; treat > −0.5 as ‘on’)
+        input_positive  = torch.sum(cond > -0.5).item()
+        total_pixels    = cond.numel()
+        target_positive = torch.sum(coeffs > -0.5).item()
         print(f"  Input positive pixels: {input_positive}/{total_pixels} ({input_positive/total_pixels*100:.1f}%)")
-        print(f"  Target positive pixels: {target_positive}/{total_pixels} ({target_positive/total_pixels*100:.1f}%)")
-        
-        if input_positive < total_pixels * 0.01:  # Less than 1% positive
-            print("  ⚠️  WARNING: Input data is very sparse!")
-        if target_positive < total_pixels * 0.1:  # Less than 10% positive  
-            print("  ⚠️  WARNING: Target data is very sparse!")
+        print(f"  Target positive (>−0.5) coeff-px: {target_positive}/{coeffs.numel()} ({target_positive/coeffs.numel()*100:.1f}%)")
+
     
     # Split into train/val/test with 7:1:2 ratio and save indices
-    train_dataset, val_dataset, test_dataset, train_subjects, val_subjects = create_train_val_datasets_9_1_split(
-        full_dataset, 
-        random_state=42
+    train_dataset, val_dataset, train_subjects, val_subjects = create_train_val_datasets_9_1_split_wavelet(
+        full_dataset, random_state=42
     )
+    test_dataset = full_dataset
     
+    # --- add in train.py, after you build (train_dataset, val_dataset) ---
+    def compute_wavelet_band_stats_on_subset(ds_subset):
+        """Return per-band (mu, sigma) over the subset, without changing dataset contents."""
+        # ds_subset is a torch.utils.data.Subset pointing to Wavelet2DDataset
+        base_ds = ds_subset.dataset if isinstance(ds_subset, torch.utils.data.Subset) else ds_subset
+        indices = ds_subset.indices if isinstance(ds_subset, torch.utils.data.Subset) else range(len(ds_subset))
+
+        # running sums to avoid big tensors in memory
+        sum_b = torch.zeros(4, dtype=torch.float64)
+        sumsq_b = torch.zeros(4, dtype=torch.float64)
+        n_pix = 0
+
+        for i in indices:
+            _, w = base_ds[i]                 # w: [4, H/2, W/2]  (non-standardized in your current setup)
+            w = w.double()
+            sum_b += w.view(4, -1).sum(dim=1)
+            sumsq_b += (w.view(4, -1) ** 2).sum(dim=1)
+            n_pix += w[0].numel()
+
+        mu = (sum_b / n_pix).float()
+        var = (sumsq_b / n_pix - (sum_b / n_pix) ** 2).float().clamp_min(1e-8)
+        sigma = var.sqrt()
+        return mu, sigma
+    
+
+    # after create_train_val_datasets_9_1_split_wavelet(...)
+    mu, sigma = compute_wavelet_band_stats_on_subset(train_dataset)
+
+    # Attach to the SAME dataset instance that backs your Subsets,
+    # then enable standardization so __getitem__ starts normalizing the bands.
+    full_dataset.mu = mu
+    full_dataset.sigma = sigma
+    full_dataset.standardize = True
+    #full_dataset.clip_mode = 'none' 
+    #full_dataset.clip_k = 4.0  # keep consistent everywhere
+
+    print(f"Per-band μ: {mu.tolist()}")
+    print(f"Per-band σ: {sigma.tolist()}")
+
+
     # Save test indices for reproducible testing
     test_indices = list(range(len(full_dataset)))  # All indices since test = whole dataset
     indices_file = os.path.join(images_dir, 'test_indices.json')
@@ -246,7 +197,6 @@ else:
     full_dataset = CTImageGenerator(
         data_root,
         input_size=input_size,
-        transform=transform
     )
     
     # Use simple splitting for unconditional (9:1 train:val, all as test)
@@ -277,15 +227,138 @@ print(f"Train size: {len(train_dataset)}")
 print(f"Val size: {len(val_dataset)}")
 print(f"Test size: {len(test_dataset)}")
 
-in_channels = num_class_labels + 1 if with_condition else 1  # +1 for the target image when conditioning
-out_channels = 1  # CT scans are single channel
+# Add these tests to your train.py right after the DWT/iDWT test:
+
+def test_real_data_reconstruction(dataset, out_dir=None):
+    """Test reconstruction with real dataset samples (handles standardized coeffs)."""
+    out_dir = out_dir or "."
+    #os.makedirs(out_dir, exist_ok=True)
+
+    print("\n🔍 Testing real data reconstruction...")
+
+    if len(dataset) == 0:
+        print("Dataset is empty"); return
+
+    cond, coeffs = dataset[0]  # coeffs are possibly standardized: [4,H/2,W/2]
+
+    # De-standardize if needed
+    if getattr(dataset, "standardize", False):
+        mu  = dataset.mu.view(4,1,1)
+        sigma = dataset.sigma.view(4,1,1)
+        coeffs_raw = coeffs * (sigma + 1e-6) + mu
+    else:
+        coeffs_raw = coeffs
+
+    print(f"Real coeffs (raw) shape: {coeffs_raw.shape}")
+    print(f"Real coeffs (raw) range: [{coeffs_raw.min():.4f}, {coeffs_raw.max():.4f}]")
+    print(f"Real coeffs (raw) mean per band: {coeffs_raw.mean(dim=[1,2])}")
+    print(f"Real coeffs (raw) std per band:  {coeffs_raw.std(dim=[1,2])}")
+
+    # Energy check on RAW coeffs
+    ll_energy    = (coeffs_raw[0]   ** 2).mean()
+    other_energy = (coeffs_raw[1:]  ** 2).mean()
+    print(f"LL band energy: {ll_energy:.4f}, Other bands energy: {other_energy:.4f}")
+    print(f"LL/Others ratio: {ll_energy/other_energy:.2f} (should be >> 1)")
+
+    # Reconstruct
+    recon = idwt_haar_1level(coeffs_raw.unsqueeze(0))   # [1,1,H,W] in ~[-1,1]
+    print(f"Reconstructed range: [{recon.min():.4f}, {recon.max():.4f}]")
+
+    save_image((recon.clamp(-1,1)+1)*0.5, os.path.join(out_dir, "debug_real_reconstruction.png"))
+    save_image((cond+1)*0.5,               os.path.join(out_dir, "debug_real_mask.png"))
+    print(f"✅ Saved to: {os.path.join(out_dir, 'debug_real_reconstruction.png')} and debug_real_mask.png")
+
+
+@torch.no_grad()
+def analyze_model_output(model, image_size, dataset, out_dir="."):
+    model.eval()
+    """Analyze what the model is actually generating"""
+    print("\n🔍 Analyzing model output...")
+    
+    if len(dataset) > 0:
+        # Get a sample for conditioning
+        cond, target_coeffs = dataset[0]
+        cond = cond.unsqueeze(0).cuda()  # [1,1,H/2,W/2]
+        target_coeffs = target_coeffs.unsqueeze(0).cuda()  # [1,4,H/2,W/2]
+        
+        print(f"Target coeffs stats:")
+        print(f"  Range: [{target_coeffs.min():.4f}, {target_coeffs.max():.4f}]")
+        print(f"  Mean per band: {target_coeffs.mean(dim=[2,3]).cpu()}")
+        print(f"  Std per band: {target_coeffs.std(dim=[2,3]).cpu()}")
+        
+        # Generate with current model
+        gen_coeffs = model.p_sample_loop(
+            shape=(1, 4, image_size, image_size),
+            condition_tensors=cond,
+            clip_denoised=True
+        )
+        print(f"Generated coeffs stats:")
+        print(f"  Range: [{gen_coeffs.min():.4f}, {gen_coeffs.max():.4f}]")
+        print(f"  Mean per band: {gen_coeffs.mean(dim=[2,3]).cpu()}")
+        print(f"  Std per band: {gen_coeffs.std(dim=[2,3]).cpu()}")
+        
+        # Check if generated coefficients are reasonable
+        target_ll_energy = (target_coeffs[0, 0] ** 2).mean()
+        gen_ll_energy = (gen_coeffs[0, 0] ** 2).mean()
+        target_hf_energy = (target_coeffs[0, 1:] ** 2).mean()
+        gen_hf_energy = (gen_coeffs[0, 1:] ** 2).mean()
+        
+        print(f"Energy comparison:")
+        print(f"  Target LL: {target_ll_energy:.4f}, Generated LL: {gen_ll_energy:.4f}")
+        print(f"  Target HF: {target_hf_energy:.4f}, Generated HF: {gen_hf_energy:.4f}")
+        base_ds = dataset.dataset if isinstance(dataset, torch.utils.data.Subset) else dataset
+        if getattr(base_ds, 'standardize', False):
+            clip_mode = getattr(base_ds, 'clip_mode', 'hard')
+            if clip_mode == 'hard':
+                K = float(getattr(base_ds, 'clip_k', 4.0))
+                gen_coeffs    = gen_coeffs * K
+                target_coeffs = target_coeffs * K
+            # soft/none: do NOT multiply by K
+
+            mu  = base_ds.mu.view(1,4,1,1).to(gen_coeffs.device)
+            std = base_ds.sigma.view(1,4,1,1).to(gen_coeffs.device)
+            gen_coeffs    = gen_coeffs * (std + 1e-6) + mu
+            target_coeffs = target_coeffs * (std + 1e-6) + mu
+
+        # Convert to image space
+        gen_img = idwt_haar_1level(gen_coeffs)
+        target_img = idwt_haar_1level(target_coeffs)
+        
+        print(f"Reconstructed images:")
+        print(f"  Target: [{target_img.min():.4f}, {target_img.max():.4f}]")
+        print(f"  Generated: [{gen_img.min():.4f}, {gen_img.max():.4f}]")
+        
+        # Save comparison
+        gen_01 = (gen_img.clamp(-1, 1) + 1) * 0.5
+        target_01 = (target_img.clamp(-1, 1) + 1) * 0.5
+        cond_01 = (cond + 1) * 0.5
+        
+        save_image(torch.cat([cond_01, target_01, gen_01], dim=3), "debug_comparison.png")
+        print("✅ Saved debug_comparison.png: [mask | target | generated]")
+        
+        # Check if model is just generating random noise
+        gen_coeffs_random = torch.randn_like(gen_coeffs) * gen_coeffs.std()
+        random_img = idwt_haar_1level(gen_coeffs_random)
+        random_01 = (random_img.clamp(-1, 1) + 1) * 0.5
+        save_image(random_01, "debug_random_noise.png")
+        print("✅ Saved debug_random_noise.png for comparison")
+
+# Add these calls to your train.py after the DWT consistency test:
+#test_real_data_reconstruction(full_dataset, out_dir=images_dir)
+
+# Only run model analysis after some training steps, not at the very beginning
+#analyze_model_output(trainer.ema_model, diffusion, val_dataset)
+
+image_size_half = input_size // 2
+in_channels  = 4 + (1 if with_condition else 0)   # =5 when conditional
+out_channels = 4
 
 model = create_model(
-    input_size, 
-    num_channels, 
-    num_res_blocks, 
-    in_channels=in_channels, 
-    out_channels=out_channels
+    image_size_half,          # UNet’s spatial size now H/2, W/2
+    num_channels,
+    num_res_blocks,
+    in_channels=in_channels,  # 5
+    out_channels=out_channels # 4
 ).cuda()
 
 # ✅ ADD: Manual weight initialization to fix zero outputs
@@ -306,15 +379,17 @@ print("Applying manual weight initialization...")
 model.apply(init_weights)
 print("✅ Model weights initialized")
 
+band_weights = [float(x) for x in args.band_weights.split(',')]
 diffusion = GaussianDiffusion(
     model,
-    image_size=input_size,
+    image_size=image_size_half,
     timesteps=args.timesteps,
-    loss_type=loss_type,  # ✅ Use configurable loss type
+    loss_type=loss_type,
     with_condition=with_condition,
-    channels=out_channels
-    # Note: beta_schedule not supported by this GaussianDiffusion implementation
+    channels=out_channels,
+    band_loss_weights=band_weights
 ).cuda()
+
 
 #if len(resume_weight) > 0 and os.path.exists(resume_weight):
 #    weight = torch.load(resume_weight, map_location='cuda')
@@ -435,207 +510,70 @@ def save_generation_organized(generated_img, original_dataset, test_index, data_
         print(f"❌ Error saving organized generation for index {test_index}: {e}")
         return False
     
+@torch.no_grad()
+def test_model_wavelet(ema_model, test_dataset, test_results_dir, full_dataset, data_root, with_condition=True):
+    from diffusion_model.trainer import idwt_haar_1level
+    ema_model.eval()
+    os.makedirs(test_results_dir, exist_ok=True)
 
-def test_model(diffusion_model, test_dataset, test_results_dir, full_dataset, data_root, with_condition=True):
-    """
-    Test the trained model and save results in organized folders
-    
-    Args:
-        diffusion_model: The trained diffusion model
-        test_dataset: Test dataset (might be Subset)
-        test_results_dir: Directory for test results (keeping for metrics)
-        full_dataset: Original full dataset to access file paths
-        data_root: Root data directory for organized saving
-        with_condition: Whether using conditional generation
-    """
-    
-    print(f"\n🧪 TESTING MODEL ON {len(test_dataset)} TEST SAMPLES")
-    print("=" * 60)
-    
-    all_real_images = []
-    all_generated_images = []
-    saved_count = 0
-    
-    diffusion_model.eval()
-    
-    with torch.no_grad():
-        for i in range(min(len(test_dataset), 50)):  # Test on first 50 samples
-            if i % 10 == 0:
-                print(f"Testing sample {i+1}/{min(len(test_dataset), 50)}...")
-            
-            try:
-                if with_condition:
-                    test_data = test_dataset[i]
-                    input_tensor = test_data['input'].unsqueeze(0).cuda()
-                    target_tensor = test_data['target'].unsqueeze(0).cuda()
-                    
-                    # Generate sample
-                    generated = diffusion_model.sample(batch_size=1, condition_tensors=input_tensor)
-                    
-                    # 🆕 Get original dataset index (handle Subset case)
-                    if hasattr(test_dataset, 'indices'):
-                        # test_dataset is a Subset
-                        original_index = test_dataset.indices[i]
-                    else:
-                        # test_dataset is the full dataset
-                        original_index = i
-                    
-                    # 🆕 Save in organized folder structure
-                    success = save_generation_organized(
-                        generated[0].cpu().numpy(), 
-                        full_dataset, 
-                        original_index, 
-                        data_root
-                    )
-                    
-                    if success:
-                        saved_count += 1
-                    
-                    # 🆕 OPTIONAL: Still save in test_results_dir for metrics/comparison
-                    # (You can remove this section if you don't want duplicate saves)
-                    save_image_png(input_tensor[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_input.png"),
-                                  is_input_label=True)
-                    save_image_png(target_tensor[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_target.png"))
-                    save_image_png(generated[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
-                    
-                    # Collect for metrics
-                    all_real_images.append(target_tensor[0])
-                    all_generated_images.append(generated[0])
-                    
-                else:
-                    # Unconditional generation - save in test_results_dir only
-                    generated = diffusion_model.sample(batch_size=1)
-                    save_image_png(generated[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
-                    
-            except Exception as e:
-                print(f"Error testing sample {i}: {e}")
-                continue
-    
-    print(f"✅ Saved {saved_count} generations in organized folder structure")
-    
-    if with_condition and all_real_images:
-        # Calculate metrics
-        real_images_tensor = torch.stack(all_real_images)
-        generated_images_tensor = torch.stack(all_generated_images)
-        
-        print(f"\n📊 CALCULATING METRICS...")
-        fid_score = calculate_fid(real_images_tensor, generated_images_tensor)
-        ssim_score = calculate_ssim(real_images_tensor, generated_images_tensor)
-        
-        print(f"📈 TEST RESULTS:")
-        print(f"   FID Score: {fid_score:.4f}")
-        print(f"   SSIM Score: {ssim_score:.4f}")
-        print(f"   Test samples: {len(all_real_images)}")
-        print(f"   Organized saves: {saved_count}")
-        
-        # Save metrics
-        metrics = {
-            'fid_score': float(fid_score),
-            'ssim_score': float(ssim_score),
-            'num_test_samples': len(all_real_images),
-            'organized_saves': saved_count,
-            'test_date': time.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        with open(os.path.join(test_results_dir, 'metrics.json'), 'w') as f:
-            json.dump(metrics, f, indent=2)
-        
-        print(f"✅ Test results saved to: {test_results_dir}")
-        print(f"✅ Metrics saved to: {os.path.join(test_results_dir, 'metrics.json')}")
-        print(f"✅ Organized generations saved in: {data_root}/{{subject_id}}/positive/generation/")
-        
-        return fid_score, ssim_score
-    
-    return 0.0, 0.0
-'''
-def test_model(diffusion_model, test_dataset, test_results_dir, with_condition=True):
-    """Test the trained model and save results with FID/SSIM metrics"""
-    
-    #clear_results_folder(test_results_dir)
-    #os.makedirs(test_results_dir, exist_ok=True)
-    
-    print(f"\n🧪 TESTING MODEL ON {len(test_dataset)} TEST SAMPLES")
-    print("=" * 60)
-    
-    all_real_images = []
-    all_generated_images = []
-    
-    diffusion_model.eval()
-    
-    with torch.no_grad():
-        for i in range(min(len(test_dataset), 50)):  # Test on first 50 samples
-            if i % 10 == 0:
-                print(f"Testing sample {i+1}/{min(len(test_dataset), 50)}...")
-            
-            try:
-                if with_condition:
-                    test_data = test_dataset[i]
-                    input_tensor = test_data['input'].unsqueeze(0).cuda()
-                    target_tensor = test_data['target'].unsqueeze(0).cuda()
-                    
-                    # Generate sample
-                    generated = diffusion_model.sample(batch_size=1, condition_tensors=input_tensor)
-                    
-                    # Save individual results
-                    save_image_png(input_tensor[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_input.png"),
-                                  is_input_label=True)  # ✅ Enhanced input visualization
-                    save_image_png(target_tensor[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_target.png"))
-                    save_image_png(generated[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
-                    
-                    # Collect for metrics
-                    all_real_images.append(target_tensor[0])
-                    all_generated_images.append(generated[0])
-                    
-                else:
-                    # Unconditional generation
-                    generated = diffusion_model.sample(batch_size=1)
-                    save_image_png(generated[0].cpu().numpy(), 
-                                  os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
-                    
-            except Exception as e:
-                print(f"Error testing sample {i}: {e}")
-                continue
-    
-    if with_condition and all_real_images:
-        # Calculate metrics
-        real_images_tensor = torch.stack(all_real_images)
-        generated_images_tensor = torch.stack(all_generated_images)
-        
-        print(f"\n📊 CALCULATING METRICS...")
-        fid_score = calculate_fid(real_images_tensor, generated_images_tensor)
-        ssim_score = calculate_ssim(real_images_tensor, generated_images_tensor)
-        
-        print(f"📈 TEST RESULTS:")
-        print(f"   FID Score: {fid_score:.4f}")
-        print(f"   SSIM Score: {ssim_score:.4f}")
-        print(f"   Test samples: {len(all_real_images)}")
-        
-        # Save metrics
-        metrics = {
-            'fid_score': float(fid_score),
-            'ssim_score': float(ssim_score),
-            'num_test_samples': len(all_real_images),
-            'test_date': time.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        with open(os.path.join(test_results_dir, 'metrics.json'), 'w') as f:
-            json.dump(metrics, f, indent=2)
-        
-        print(f"✅ Test results saved to: {test_results_dir}")
-        print(f"✅ Metrics saved to: {os.path.join(test_results_dir, 'metrics.json')}")
-        
-        return fid_score, ssim_score
-    
-    return 0.0, 0.0
+    # convenience to unwrap Subset
+    def base_and_idx(ds, i):
+        return (ds.dataset, ds.indices[i]) if isinstance(ds, torch.utils.data.Subset) else (ds, i)
 
-'''
+    saved = 0
+    for i in range(min(len(test_dataset), 50)):
+        try:
+            base_ds, orig_idx = base_and_idx(test_dataset, i)
+            ct_path, mk_path = base_ds.file_paths_at(orig_idx)
+            subject_id, slice_id = base_ds.get_subject_slice_from_ct(ct_path)
+
+            cond, target_coeffs = test_dataset[i]         # (mask_down2, coeffs)
+            cond = cond.unsqueeze(0).cuda()               # [1,1,H/2,W/2]
+            target_coeffs = target_coeffs.unsqueeze(0).cuda()
+
+            Hh = ema_model.image_size
+            base_ds = test_dataset.dataset if isinstance(test_dataset, Subset) else test_dataset
+            clip_mode = getattr(base_ds, 'clip_mode', 'none')
+            #use_clip = (clip_mode == 'hard')
+            use_clip = True
+
+            gen_coeffs = ema_model.p_sample_loop(
+                shape=(1, 4, Hh, Hh),
+                condition_tensors=cond,
+                clip_denoised=use_clip
+            )
+
+            #base_ds = self.val_dataset.dataset if isinstance(self.val_dataset, torch.utils.data.Subset) else self.val_dataset
+            if getattr(base_ds, 'standardize', False):
+                clip_mode = getattr(base_ds, 'clip_mode', 'hard')
+                if clip_mode == 'hard':
+                    K = float(getattr(base_ds, 'clip_k', 4.0))
+                    gen_coeffs    = gen_coeffs * K
+                    target_coeffs = target_coeffs * K
+                mu  = base_ds.mu.view(1,4,1,1).to(gen_coeffs.device)
+                std = base_ds.sigma.view(1,4,1,1).to(gen_coeffs.device)
+                gen_coeffs    = gen_coeffs * (std + 1e-6) + mu
+                target_coeffs = target_coeffs * (std + 1e-6) + mu
+
+            gen_img01 = (idwt_haar_1level(gen_coeffs).clamp(-1,1) + 1)*0.5
+            gt_img01  = (idwt_haar_1level(target_coeffs).clamp(-1,1) + 1)*0.5
+
+            # subject-aware save under data_root / subject / positive / generation
+            subj_gen_dir = os.path.join(data_root, subject_id, "positive", "generation")
+            os.makedirs(subj_gen_dir, exist_ok=True)
+
+            save_image(gen_img01, os.path.join(subj_gen_dir, f"{subject_id}_{slice_id}.png"))
+            saved += 1
+
+            # (optional) also write to test_results_dir for metrics
+            save_image(gen_img01, os.path.join(test_results_dir, f"test_{i:03d}_generated.png"))
+            save_image(gt_img01,  os.path.join(test_results_dir, f"test_{i:03d}_target.png"))
+            save_image((cond+1)*0.5, os.path.join(test_results_dir, f"test_{i:03d}_mask.png"))
+
+        except Exception as e:
+            print(f"❌ Test sample {i} failed: {e}")
+
+    print(f"✅ Saved {saved} generations to subject folders.")
 
 
 def save_image_png(img_array, filepath, add_stats=False, is_input_label=False):
@@ -756,85 +694,210 @@ class CTTrainer(Trainer):
         print(f"📊 Loss curve saved to: {plot_path}")
         
     def validate_and_save(self, milestone):
-        """Generate samples from validation set and save results"""
+        """Generate samples from validation set and save results (wavelet -> iDWT, subject-aware)."""
         print("Generating validation samples...")
-        
-        # Create validation results subdirectory
+
+        # epoch folder
         val_milestone_dir = os.path.join(self.val_results_dir, f"epoch_{milestone * self.save_and_sample_every}")
         os.makedirs(val_milestone_dir, exist_ok=True)
-        
-        # Generate a few validation samples
+
         num_val_samples = min(4, len(self.val_dataset))
-        
         for i in range(num_val_samples):
             try:
-                if self.with_condition:
-                    # Get validation sample
-                    val_data = self.val_dataset[i]
-                    input_tensor = val_data['input'].unsqueeze(0).cuda()
-                    target_tensor = val_data['target']
-                    
-                    print(f"Val sample {i}: input shape={input_tensor.shape}, target shape={target_tensor.shape}")
-                    
-                    # Generate sample
-                    generated = self.ema_model.sample(batch_size=1, condition_tensors=input_tensor)
-                    generated_img = generated[0].cpu().numpy()
-                    
-                    print(f"Generated shape: {generated_img.shape}")
-                    
-                    # Save input (label), target (real scan), and generated scan with statistics
-                    save_image_png(input_tensor[0].cpu().numpy(), 
-                                  os.path.join(val_milestone_dir, f"val_{i}_input.png"), 
-                                  add_stats=True, is_input_label=True)  # ✅ Enhanced input visualization
-                    save_image_png(target_tensor.numpy(), 
-                                  os.path.join(val_milestone_dir, f"val_{i}_target.png"), add_stats=True)
-                    save_image_png(generated_img, 
-                                  os.path.join(val_milestone_dir, f"val_{i}_generated.png"), add_stats=True)
+                # --- unwrap Subset to recover subject + slice filenames ---
+                if isinstance(self.val_dataset, torch.utils.data.Subset):
+                    base_ds = self.val_dataset.dataset
+                    orig_idx = self.val_dataset.indices[i]
                 else:
-                    # Unconditional generation
-                    generated = self.ema_model.sample(batch_size=1)
-                    generated_img = generated[0].cpu().numpy()
-                    save_image_png(generated_img, 
-                                  os.path.join(val_milestone_dir, f"val_{i}_generated.png"), add_stats=True)
+                    base_ds = self.val_dataset
+                    orig_idx = i
+
+                ct_path, mk_path = base_ds.file_paths_at(orig_idx)  # you added this helper
+                subject_id, slice_id = base_ds.get_subject_slice_from_ct(ct_path)
+
+                # --- fetch sample (supports tuple or dict) ---
+                sample = self.val_dataset[i]
+                if isinstance(sample, (tuple, list)) and len(sample) == 2:
+                    cond, target_coeffs = sample               # cond:[1,H/2,W/2], target:[4,H/2,W/2]
+                elif isinstance(sample, dict):
+                    cond, target_coeffs = sample['input'], sample['target']
+                else:
+                    raise ValueError("Unexpected val sample format")
+
+                cond = cond.unsqueeze(0).cuda().float()         # [1,1,H/2,W/2]
+                target_coeffs = target_coeffs.unsqueeze(0).cuda().float()  # [1,4,H/2,W/2]
+
+
+                # --- sample coeffs in wavelet space (no clamp), then iDWT ---
+                Hh = self.image_size  # this should be input_size//2 from your diffusion
+                base_ds = self.val_dataset.dataset if isinstance(self.val_dataset, torch.utils.data.Subset) else self.val_dataset
+                clip_mode = getattr(base_ds, 'clip_mode', 'none')
+                #use_clip = (clip_mode == 'hard')
+                use_clip = True
+
+                gen_coeffs = self.ema_model.p_sample_loop(
+                    shape=(1, 4, Hh, Hh),
+                    condition_tensors=cond,
+                    clip_denoised=use_clip
+                )
+                # 🚨 UNCOMMENT AND ADD THIS DEBUG CODE HERE:
+                print(f"\n🚨 EMERGENCY DEBUG - STEP {self.step}:")
+                print(f"TARGET coeffs (standardized): range=[{target_coeffs.min():.4f}, {target_coeffs.max():.4f}], mean={target_coeffs.mean():.4f}, std={target_coeffs.std():.4f}")
+                print(f"GEN coeffs (standardized):    range=[{gen_coeffs.min():.4f}, {gen_coeffs.max():.4f}], mean={gen_coeffs.mean():.4f}, std={gen_coeffs.std():.4f}")
+
+                # Check individual bands (before de-standardization)
+                for band in range(4):
+                    band_names = ['LL', 'LH', 'HL', 'HH']
+                    t_band = target_coeffs[0, band]
+                    g_band = gen_coeffs[0, band]
+                    print(f"  {band_names[band]} (std): Target=[{t_band.min():.3f},{t_band.max():.3f}] vs Gen=[{g_band.min():.3f},{g_band.max():.3f}]")
+
+                # Check energy in standardized space
+                gen_energy = (gen_coeffs ** 2).mean()
+                target_energy = (target_coeffs ** 2).mean()
+                print(f"Energy (std): Target={target_energy:.4f}, Generated={gen_energy:.4f}, Ratio={gen_energy/target_energy:.4f}")
+
+
+                # Add this RIGHT in your validate_and_save method, 
+                # just after gen_coeffs is generated:
+                """
+                print(f"\n🚨 EMERGENCY DEBUG - STEP {self.step}:")
+                print(f"TARGET coeffs: range=[{target_coeffs.min():.4f}, {target_coeffs.max():.4f}], mean={target_coeffs.mean():.4f}, std={target_coeffs.std():.4f}")
+                print(f"GEN coeffs:    range=[{gen_coeffs.min():.4f}, {gen_coeffs.max():.4f}], mean={gen_coeffs.mean():.4f}, std={gen_coeffs.std():.4f}")
+
+                # Check individual bands
+                for band in range(4):
+                    band_names = ['LL', 'LH', 'HL', 'HH']
+                    t_band = target_coeffs[0, band]
+                    g_band = gen_coeffs[0, band]
+                    print(f"  {band_names[band]}: Target=[{t_band.min():.3f},{t_band.max():.3f}] vs Gen=[{g_band.min():.3f},{g_band.max():.3f}]")
+
+                # Check if generated coeffs are essentially zero/noise
+                gen_energy = (gen_coeffs ** 2).mean()
+                target_energy = (target_coeffs ** 2).mean()
+                print(f"Energy: Target={target_energy:.4f}, Generated={gen_energy:.4f}, Ratio={gen_energy/target_energy:.4f}")
+
+                # If generated energy is much smaller, that's our problem!
+                if gen_energy < target_energy * 0.01:
+                    print("🚨 PROBLEM FOUND: Generated coefficients have much lower energy than target!")
+                    print("   This means model is generating nearly-zero coefficients → noise images")
+                    
+                # Quick fix test: Scale up generated coefficients
+                scale_factor = torch.sqrt(target_energy / (gen_energy + 1e-8))
+                print(f"Suggested scale factor: {scale_factor:.4f}")
+
+                # --- subject-aware save path ---
+
+
+                if scale_factor > 2.0:
+                    print("🔧 Testing scaled coefficients...")
+                    gen_coeffs_scaled = gen_coeffs * scale_factor
+                    gen_img_scaled = idwt_haar_1level(gen_coeffs_scaled)
+                    gen_scaled_01 = (gen_img_scaled.clamp(-1, 1) + 1) * 0.5
+                    save_image(gen_scaled_01, os.path.join(subj_dir, f"{subject_id}_{slice_id}_generated_SCALED.png"))
+                    print(f"✅ Saved SCALED version - check if this looks better!")
+                """                
+                subj_dir = os.path.join(val_milestone_dir, subject_id, "positive", "generation")
+                os.makedirs(subj_dir, exist_ok=True)
+                #base_ds = self.val_dataset.dataset if isinstance(self.val_dataset, torch.utils.data.Subset) else self.val_dataset
+                if getattr(base_ds, 'standardize', False):
+                    clip_mode = getattr(base_ds, 'clip_mode', 'hard')
+                    if clip_mode == 'hard':              # ← multiply by K only for hard-clip datasets
+                        K = float(getattr(base_ds, 'clip_k', 4.0))
+                        gen_coeffs    = gen_coeffs * K
+                        target_coeffs = target_coeffs * K
+                    mu  = base_ds.mu.view(1,4,1,1).to(gen_coeffs.device)
+                    std = base_ds.sigma.view(1,4,1,1).to(gen_coeffs.device)
+                    gen_coeffs    = gen_coeffs * (std + 1e-6) + mu   # ← de-standardize
+                    target_coeffs = target_coeffs * (std + 1e-6) + mu
+
+
+                # --- LL/HF ablation in standardized space ---
+                mixA = gen_coeffs.clone()         # (A) gen LL + target HF
+                mixA[:, 1:] = target_coeffs[:, 1:]
+
+                mixB = target_coeffs.clone()      # (B) target LL + gen HF
+                mixB[:, 1:] = gen_coeffs[:, 1:]
+
+                # de-standardize both (respecting clip_mode)
+                mode = getattr(base_ds, 'clip_mode', 'none')
+                def destd(t):
+                    t = t.clone()
+                    if mode == 'hard':
+                        K = getattr(base_ds, 'clip_k', 4.0)
+                        t = t * K
+                    mu  = base_ds.mu.view(1,4,1,1).to(t.device)
+                    std = base_ds.sigma.view(1,4,1,1).to(t.device)
+                    return t * (std + 1e-6) + mu
+
+                mixA_raw = destd(mixA)
+                mixB_raw = destd(mixB)
+
+                # iDWT -> [0,1]
+                mixA_img01 = (idwt_haar_1level(mixA_raw).clamp(-1,1) + 1) * 0.5
+                mixB_img01 = (idwt_haar_1level(mixB_raw).clamp(-1,1) + 1) * 0.5
+
+                save_image(mixA_img01, os.path.join(subj_dir, f"{subject_id}_{slice_id}_mixA_genLL_targetHF.png"))
+                save_image(mixB_img01, os.path.join(subj_dir, f"{subject_id}_{slice_id}_mixB_targetLL_genHF.png"))
+
+
+                gen_img  = idwt_haar_1level(gen_coeffs)         # [1,1,H,W] ~ [-1,1]
+                gt_img   = idwt_haar_1level(target_coeffs)      # [1,1,H,W] ~ [-1,1]
+                gen01    = (gen_img.clamp(-1, 1) + 1) * 0.5     # [0,1]
+                gt01     = (gt_img.clamp(-1, 1) + 1) * 0.5
+                mask01   = (cond + 1) * 0.5                     # [0,1]
+
+                save_image(mask01, os.path.join(subj_dir, f"{subject_id}_{slice_id}_mask.png"))
+                save_image(gt01,   os.path.join(subj_dir, f"{subject_id}_{slice_id}_target.png"))
+                save_image(gen01,  os.path.join(subj_dir, f"{subject_id}_{slice_id}_generated.png"))
+
+                print(f"Saved {subject_id}_{slice_id} to {subj_dir}")
+
             except Exception as e:
                 print(f"Error generating validation sample {i}: {e}")
                 continue
-    
+
     def train(self):
-        """Override train method to include validation"""
+        """Override train to include validation (tuple/dict safe, wavelet-ready)."""
         from functools import partial
-        import time
-        
         backwards = partial(loss_backwards, self.fp16)
         start_time = time.time()
 
         while self.step < self.train_num_steps:
-            accumulated_loss = []
-            for i in range(self.gradient_accumulate_every):
-                if self.with_condition:
-                    data = next(self.dl)
-                    input_tensors = data['input'].cuda()
-                    target_tensors = data['target'].cuda()
-                    loss = self.model(target_tensors, condition_tensors=input_tensors)
-                else:
-                    data = next(self.dl).cuda()
-                    loss = self.model(data)
-                loss = loss.sum() / self.batch_size
-                print(f'{self.step}: {loss.item():.6f}')  # More decimal places to see small changes
-                
-                # Track loss for plotting
-                self.loss_history.append({
-                    'step': self.step,
-                    'loss': loss.item()
-                })
-                
-                backwards(loss / self.gradient_accumulate_every, self.opt)
-                accumulated_loss.append(loss.item())
+            accumulated_loss = 0.0
 
-            # Record loss
-            average_loss = np.mean(accumulated_loss)
+            for i in range(self.gradient_accumulate_every):
+                batch = next(self.dl)
+
+                if self.with_condition:
+                    # Accept (cond, target) or dict {'input':..., 'target':...}
+                    if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                        input_tensors, target_tensors = batch
+                    elif isinstance(batch, dict):
+                        input_tensors, target_tensors = batch['input'], batch['target']
+                    else:
+                        raise ValueError("Batch must be (cond, target) or dict with 'input' and 'target'")
+
+                    input_tensors  = input_tensors.cuda(non_blocking=True).float()  # [B,1,H/2,W/2]
+                    target_tensors = target_tensors.cuda(non_blocking=True).float() # [B,4,H/2,W/2]
+
+                    loss = self.model(target_tensors, condition_tensors=input_tensors)  # diffusion returns mean loss
+                else:
+                    data = batch.cuda(non_blocking=True).float()
+                    loss = self.model(data)
+
+                if loss.ndim > 0:
+                    loss = loss.mean()
+
+                print(f'{self.step}.{i}: {loss.item():.6f}')
+                self.loss_history.append({'step': self.step, 'loss': loss.item()})
+                backwards(loss / self.gradient_accumulate_every, self.opt)
+                accumulated_loss += loss.item()
+
+            average_loss = accumulated_loss / float(self.gradient_accumulate_every)
             self.writer.add_scalar("training_loss", average_loss, self.step)
 
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clip_val)
             self.opt.step()
             self.opt.zero_grad()
 
@@ -843,54 +906,44 @@ class CTTrainer(Trainer):
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
-                
-                # Save model checkpoint
                 self.save(milestone)
-                
-                # Generate and save validation samples
                 self.validate_and_save(milestone)
-                
-                # Update loss plot
                 self.plot_loss_curve()
 
             self.step += 1
 
         print('training completed')
-        
-        # Final loss plot
         self.plot_loss_curve()
-        
         end_time = time.time()
         execution_time = (end_time - start_time) / 3600
         self.writer.add_hparams(
-            {
-                "lr": self.train_lr,
-                "batchsize": self.train_batch_size,
-                "image_size": self.image_size,
-                "execution_time (hour)": execution_time
-            },
+            {"lr": self.train_lr, "batchsize": self.train_batch_size, "image_size": self.image_size, "execution_time (hour)": execution_time},
             {"last_loss": average_loss}
         )
         self.writer.close()
 
+
+
 trainer = CTTrainer(
     val_dataset,
     val_results_dir,
-    images_dir,  # Add images_dir for loss plotting
+    images_dir,
     diffusion,
-    train_dataset,  # Use train_dataset instead of full dataset
-    image_size=input_size,
+    train_dataset,                # wavelet dataset
+    image_size=image_size_half,   # optional; not used by your Trainer logic
     train_batch_size=args.batchsize,
     train_lr=train_lr,
     train_num_steps=args.epochs,
-    gradient_accumulate_every=gradient_accumulate_every,  # ✅ Use configurable gradient accumulation
-    ema_decay=ema_decay,  # ✅ Use configurable EMA decay
+    gradient_accumulate_every=gradient_accumulate_every,
+    ema_decay=ema_decay,
     fp16=False,
     with_condition=with_condition,
     save_and_sample_every=save_and_sample_every,
 )
 
 trainer.train()
+#out_dir = os.path.join(val_results_dir, "post_train_debug")
+#analyze_model_output(trainer.ema_model, trainer.image_size, val_dataset, out_dir=out_dir)
 
 if len(resume_weight) > 0 and os.path.exists(resume_weight):
     if resume_weight.endswith("ema_model_final.pth"):
@@ -907,7 +960,7 @@ if len(resume_weight) > 0 and os.path.exists(resume_weight):
         print(f"✅ Training resumed from step {trainer.step}")
 
 
-ema_ckpt_path = os.path.join('/home/li46460/wdm_ddpm/original/results', 'ema_model_final.pth')
+ema_ckpt_path = os.path.join('/storage/data/li46460_wdm_ddpm/wdm-ddpm/results', 'ema_model_final.pth')
 torch.save(trainer.ema_model.state_dict(), ema_ckpt_path)
 print(f"✅ EMA weights saved to {ema_ckpt_path}")
 
@@ -916,9 +969,8 @@ if run_test_after_training:
     print(f"\n🧪 RUNNING TEST EVALUATION...")
     #test_model(diffusion, test_dataset, test_results_dir, with_condition)
     #test_model(trainer.ema_model, test_dataset, test_results_dir, with_condition)
-    test_model(trainer.ema_model, test_dataset, test_results_dir, full_dataset, data_root, with_condition)
+    test_model_wavelet(trainer.ema_model, test_dataset, test_results_dir, full_dataset, data_root, with_condition)
 else:
     print(f"\n💡 To run test evaluation, use: --run_test_after_training")
     print(f"   Test indices are saved in: {os.path.join(images_dir, 'test_indices.json')}")
-    print(f"   You can run testing later using the saved indices.")
     print(f"   You can run testing later using the saved indices.")
