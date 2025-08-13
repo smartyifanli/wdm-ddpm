@@ -206,18 +206,23 @@ class Wavelet2DDataset(torch.utils.data.Dataset):
             raise ValueError(f"Unknown clip_mode: {self.clip_mode}")
 
         # --- condition mask (downsampled to H/2,W/2, in [-1,1]) ---
+        # --- condition mask (downsampled to H/2,W/2, in [-1,1]) ---
         if self.with_condition:
             mk = self._read_gray_uint8(mk_path)
             if (mk.shape[1], mk.shape[0]) != (self.input_size, self.input_size):
                 mk = cv2.resize(mk, (self.input_size, self.input_size), interpolation=cv2.INTER_NEAREST)
-            mk = torch.from_numpy(mk).float() / 255.0
+            mk = torch.from_numpy(mk).float()
+            # binarize, same rule as _load_mask_as_condition
+            if mk.max() > 1:
+                mk = (mk > 127.5).float()
+            # now to [-1,1]
             mk = mk * 2.0 - 1.0
             if mk.ndim == 2:
                 mk = mk.unsqueeze(0)  # [1,H,W]
-            # downsample to wavelet spatial size
             h2, w2 = w.shape[-2], w.shape[-1]
-            cond = torch.nn.functional.interpolate(mk.unsqueeze(0), size=(h2, w2), mode='nearest').squeeze(0)
+            cond = F.interpolate(mk.unsqueeze(0), size=(h2, w2), mode='nearest').squeeze(0)
             return cond, w
+
 
         # unconditional
         return w
