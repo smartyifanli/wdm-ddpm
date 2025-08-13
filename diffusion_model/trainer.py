@@ -103,11 +103,16 @@ class EMA():
         return old * self.beta + (1 - self.beta) * new
 
 # gaussian diffusion trainer class
+def extract(a: torch.Tensor, t: torch.LongTensor, x_shape):
+    # a: [T], t: [B], returns [B,1,1,1] broadcastable to x
+    b = t.shape[0]
+    out = a.gather(0, t).float()
+    return out.view(b, *((1,) * (len(x_shape) - 1)))
 
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+#def extract(a, t, x_shape):
+#    b, *_ = t.shape
+#    out = a.gather(-1, t)
+#    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 def noise_like(shape, device, repeat=False):
     repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
@@ -128,270 +133,387 @@ def cosine_beta_schedule(timesteps, s = 0.008):
 
 
 class GaussianDiffusion(nn.Module):
+    """
+    Diffusion in *wavelet-coefficient space* (standardized).
+    - Optional LL-only soft window in std-space via set_ll_bounds_std(...)
+    - Optional HF tanh bound (bands 1..3) each sampling step via soft_a
+    - Always-on dynamic thresholding in coeff space (Imagen-style), independent of clip_denoised
+    - Safe posterior (c2 clamped) to avoid x_t amplification
+    - Optional LL auxiliary loss at small t to stabilize illumination (x0_hat vs x_start on LL)
+    """
     def __init__(
         self,
         denoise_fn,
         *,
         image_size,
-        channels = 1,
-        timesteps = 1000,
-        loss_type = 'l1',
-        betas = None,
-        with_condition = False,
-        with_pairwised = False,
-        apply_bce = False,
-        lambda_bce = 0.0,
-        band_loss_weights=None
+        channels=1,
+        timesteps=1000,
+        loss_type='l1',
+        betas=None,
+        with_condition=False,
+        with_pairwised=False,
+        apply_bce=False,
+        lambda_bce=0.0,
+        band_loss_weights=None,
     ):
         super().__init__()
-        self.channels = channels
-        self.image_size = image_size
-        self.denoise_fn = denoise_fn
+
+        # ---------- basic ----------
+        self.channels       = channels
+        self.image_size     = image_size
+        self.denoise_fn     = denoise_fn
         self.with_condition = with_condition
         self.with_pairwised = with_pairwised
-        self.apply_bce = apply_bce
-        self.lambda_bce = lambda_bce
-        self.band_loss_weights = None
+        self.apply_bce      = apply_bce
+        self.lambda_bce     = lambda_bce
+        self.loss_type      = loss_type
 
-        if band_loss_weights is not None:
-            w = torch.tensor(band_loss_weights, dtype=torch.float32)
-            assert w.numel() == 4, "band_loss_weights must have 4 entries [LL,LH,HL,HH]"
-            self.register_buffer('band_loss_weights_buf', w)
-            self.band_loss_weights = 'buf'  # marker to say it's present
+        # ---------- coefficient-space helpers ----------
+        # (a) LL soft-window bounds (set later via set_ll_bounds_std)
+        self.ll_bounds_std = None
+        # (b) always-on dynamic threshold (Imagen-style)
+        self.enable_coeff_dynamic_threshold = True
+        self.coeff_dynamic_thresh_p = 0.995  # try 0.995–0.999
 
-        if exists(betas):
+        # optional debug print during sampling
+        self.debug_p_sample = False
+
+        # ---------- noise schedule ----------
+        if betas is not None:
             betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
         else:
             betas = cosine_beta_schedule(timesteps)
 
-        alphas = 1. - betas
-        alphas_cumprod = np.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+        alphas = 1.0 - betas
+        alphas_cumprod      = np.cumprod(alphas, axis=0)
+        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
 
-        timesteps, = betas.shape
-        self.num_timesteps = int(timesteps)
-        self.loss_type = loss_type
+        self.num_timesteps = int(betas.shape[0])
 
         to_torch = partial(torch.tensor, dtype=torch.float32)
 
-        self.register_buffer('betas', to_torch(betas))
-        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
-        self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+        # schedule buffers
+        self.register_buffer('betas',                          to_torch(betas))
+        self.register_buffer('alphas_cumprod',                 to_torch(alphas_cumprod))
+        self.register_buffer('alphas_cumprod_prev',            to_torch(alphas_cumprod_prev))
+        self.register_buffer('sqrt_alphas_cumprod',            to_torch(np.sqrt(alphas_cumprod)))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod',  to_torch(np.sqrt(1. - alphas_cumprod)))
+        self.register_buffer('log_one_minus_alphas_cumprod',   to_torch(np.log(1. - alphas_cumprod)))
+        self.register_buffer('sqrt_recip_alphas_cumprod',      to_torch(np.sqrt(1. / alphas_cumprod)))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod',    to_torch(np.sqrt(1. / alphas_cumprod - 1.0)))
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
-        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
-        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
-        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+        # posterior buffers
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.register_buffer('posterior_variance',              to_torch(posterior_variance))
+        self.register_buffer('posterior_log_variance_clipped',  to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        self.register_buffer('posterior_mean_coef1',            to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)))
+        self.register_buffer('posterior_mean_coef2',            to_torch((1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod)))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
-        self.register_buffer('posterior_variance', to_torch(posterior_variance))
-        
-        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
-        self.register_buffer('posterior_mean_coef1', to_torch(
-            betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
-        self.register_buffer('posterior_mean_coef2', to_torch(
-            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
-        self.register_buffer('posterior_mean_coef3', to_torch(
-            1. - (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+        # sanity checks (safe betas, monotone acp, c2<=1)
+        assert (self.betas > 0).all() and (self.betas < 1).all(), "betas must be in (0,1)"
+        acp = self.alphas_cumprod
+        assert torch.all(acp[1:] <= acp[:-1]), "alphas_cumprod must be non-increasing"
+        with torch.no_grad():
+            T = self.num_timesteps
+            t_test = torch.tensor([0, T//4, T//2, 3*T//4, T-1], device=acp.device, dtype=torch.long)
+            c2_test = extract(self.posterior_mean_coef2, t_test, (len(t_test), 1, 1, 1))
+            assert (c2_test <= 1.0 + 1e-5).all(), f"posterior_mean_coef2>1 somewhere: {c2_test.flatten().tolist()}"
 
-    def q_mean_variance(self, x_start, t, c=None):
-        x_hat = 0
-        mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start + x_hat
-        variance = extract(1. - self.alphas_cumprod, t, x_start.shape)
-        log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
-        return mean, variance, log_variance
+        # ---------- optional band weights ----------
+        if band_loss_weights is not None:
+            bw = torch.tensor(band_loss_weights, dtype=torch.float32).view(4)
+            assert bw.numel() == 4, "band_loss_weights must be [LL, LH, HL, HH]"
+            self.register_buffer('band_loss_weights_buf', bw)
+        else:
+            self.band_loss_weights_buf = None
 
-    def predict_start_from_noise(self, x_t, t, noise, c=None):
-        x_hat = 0.
+        # ---------- LL auxiliary loss knobs ----------
+        self.ll_x0_aux_weight = 0.12  # 0.05–0.10 works well
+        self.ll_aux_tmax      = 300   # apply only when t <= 100
+
+    # -------------------- helpers --------------------
+    #@staticmethod
+    #def _soft_clip_interval(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, softness: torch.Tensor):
+    #    """Asymmetric soft clip: lo + (hi - lo) * sigmoid(x / s), in std-space."""
+    #    s = torch.clamp(softness, min=1e-3)
+    #    return lo + (hi - lo) * torch.sigmoid(x / s)
+    
+    @staticmethod
+    def _soft_clip_interval(x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, softness: torch.Tensor):
+        """
+        Identity for x in [lo,hi]. For x<lo or x>hi, smoothly push back using softplus.
+        'softness' is a width parameter (bigger = gentler).
+        """
+        s = torch.clamp(softness, min=1e-6).to(x.dtype)
+        below = F.softplus((lo - x) / s) * s      # >0 only when x < lo
+        above = F.softplus((x - hi) / s) * s      # >0 only when x > hi
+        return x + below - above
+
+
+    def _dynamic_threshold_coeff(self, x: torch.Tensor, p: float) -> torch.Tensor:
+        """
+        Per-sample, per-band dynamic threshold (Imagen-style) in coeff std-space.
+        s = quantile(|x|, p) over H×W; clip to ±s, then divide by s.
+        Uses a floor on s to avoid blowing up tiny signals.
+        """
+        B, C, H, W = x.shape
+        s = torch.quantile(x.abs().flatten(2), q=p, dim=2).view(B, C, 1, 1)
+        s = torch.clamp(s, min=1.0)
+        return x.clamp(min=-s, max=s) / s
+
+    def _soft_bound_x0(self, x0: torch.Tensor, soft_a):
+        """HF symmetric tanh bound (a * tanh(x0/a)) per band; pass `soft_a` with 4 values or tensor."""
+        if soft_a is None:
+            return x0
+        if not torch.is_tensor(soft_a):
+            a = torch.as_tensor([soft_a] * x0.shape[1], dtype=x0.dtype, device=x0.device)
+        else:
+            a = soft_a.to(x0.device, dtype=x0.dtype)
+        a = a.view(1, -1, 1, 1)
+        return torch.tanh(x0 / (a + 1e-8)) * a
+
+    def set_ll_bounds_std(self, lo_std: float, hi_std: float, softness: float = 1.0):
+        """Register LL soft-window bounds (in standardized coeff space)."""
+        device = self.betas.device
+        self.ll_bounds_std = (
+            torch.tensor(lo_std, device=device, dtype=torch.float32),
+            torch.tensor(hi_std, device=device, dtype=torch.float32),
+            torch.tensor(softness, device=device, dtype=torch.float32),
+        )
+
+    # -------------------- forward/ posterior math --------------------
+    def q_mean_variance(self, x_start: torch.Tensor, t: torch.LongTensor):
+        mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        var  = extract(1. - self.alphas_cumprod, t, x_start.shape)
+        logv = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
+        return mean, var, logv
+
+    def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.LongTensor, noise: torch.Tensor):
         return (
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise -
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_hat
+            extract(self.sqrt_recip_alphas_cumprod,   t, x_t.shape) * x_t
+            - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
-    def q_posterior(self, x_start, x_t, t, c=None):
-        x_hat = 0.
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
-            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t +
-            extract(self.posterior_mean_coef3, t, x_t.shape) * x_hat
-        )
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+    def q_posterior(self, x_start: torch.Tensor, x_t: torch.Tensor, t: torch.LongTensor):
+        c1 = extract(self.posterior_mean_coef1, t, x_t.shape)
+        c2 = extract(self.posterior_mean_coef2, t, x_t.shape).clamp(max=0.9995)  # safe
+        mean  = c1 * x_start + c2 * x_t
+        var   = extract(self.posterior_variance,             t, x_t.shape)
+        log_v = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return mean, var, log_v
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, c=None):
-        if self.with_condition:
-            eps = self.denoise_fn(torch.cat([x, c], 1), t)
+    def p_mean_variance(self, x: torch.Tensor, t: torch.LongTensor,
+                        clip_denoised: bool, c=None, soft_a=None):
+        """
+        One reverse step in *standardized coeff space*.
+        - Predict eps -> x0_hat
+        - (optional) LL soft window in std-space
+        - (optional) HF-only dynamic threshold (once)
+        - (optional) HF-only soft bound via tanh with per-band soft_a
+        - Compute posterior from processed x0_hat
+        """
+
+        # 1) predict eps and x0_hat
+        if self.with_condition and c is not None:
+            model_in = torch.cat([x, c], dim=1)
+            eps = self.denoise_fn(model_in, t)
         else:
             eps = self.denoise_fn(x, t)
+        x0_hat = self.predict_start_from_noise(x, t=t, noise=eps)  # standardized coeffs
 
-        x_recon = self.predict_start_from_noise(x, t=t, noise=eps)
+        # 2) LL-only soft window in std-space (if configured)
+        if self.ll_bounds_std is not None:
+            lo_std, hi_std, s_std = self.ll_bounds_std
+            ll = x0_hat[:, :1]
+            ll = self._soft_clip_interval(ll, lo_std, hi_std, s_std)  # your "soft box" impl
+            x0_hat = torch.cat([ll, x0_hat[:, 1:]], dim=1)
 
-        # --- NEW: dynamic thresholding in standardized coeff space ---
-        if clip_denoised:  # treat this flag as "apply safe bound"
-            # per-sample, get 99.5% quantile of |x0|
-            B = x_recon.shape[0]
-            x_flat = x_recon.view(B, -1).abs()
-            s = torch.quantile(x_flat, 0.995, dim=1, keepdim=True)  # [B,1]
-            s = s.view(B, 1, 1, 1).clamp(min=1.0)                   # avoid tiny s
-            x_recon = (x_recon / s).clamp(-1, 1) * s                # scale then clip
-        # ------------------------------------------------------------
+        # 3) HF-only dynamic thresholding (do this ONCE, before any soft/tanh)
+        if getattr(self, "enable_coeff_dynamic_threshold", False):
+            p = float(getattr(self, "coeff_dynamic_thresh_p", 0.995))
+            hf = x0_hat[:, 1:]
+            # per-sample scale from p-quantile; don't backprop through the quantile
+            s = torch.quantile(hf.detach().abs().flatten(1), p, dim=1).clamp_min(1e-6).view(-1, 1, 1, 1)
+            # avoid boosting if s < 1
+            s = torch.maximum(s, torch.ones_like(s))
+            hf = (hf / s).clamp_(-1.0, 1.0)
+            x0_hat = torch.cat([x0_hat[:, :1], hf], dim=1)
 
-        model_mean, var, logvar = self.q_posterior(x_start=x_recon, x_t=x, t=t, c=c)
-        return model_mean, var, logvar
+        # 4) Optional HF soft bound via tanh (coeff-space); pass soft_a as [LL,LH,HL,HH]
+        if soft_a is not None:
+            if not torch.is_tensor(soft_a):
+                soft_a = torch.as_tensor(soft_a, device=x0_hat.device, dtype=x0_hat.dtype)
+            if soft_a.ndim == 1:
+                soft_a = soft_a.view(1, -1, 1, 1)  # [1,4,1,1]
+            a_hf = soft_a[:, 1:].clamp_min(1e-6)
+            hf = x0_hat[:, 1:]
+            hf = torch.tanh(hf / a_hf) * a_hf
+            x0_hat = torch.cat([x0_hat[:, :1], hf], dim=1)
+
+        # 5) (usually False in coeff space, but supported)
+        if clip_denoised:
+            x0_hat = x0_hat.clamp_(-1.0, 1.0)
+
+        # 6) posterior using processed x0_hat
+        model_mean, posterior_var, posterior_log_var = self.q_posterior(
+            x_start=x0_hat, x_t=x, t=t
+        )
+        return model_mean, posterior_var, posterior_log_var
 
 
+    # -------------------- sampling --------------------
     @torch.no_grad()
-    def p_sample(self, x, t, condition_tensors=None, clip_denoised=None, repeat_noise=False):
+    def p_sample(self, x: torch.Tensor, t: torch.LongTensor, condition_tensors=None,
+                 clip_denoised: bool = False, repeat_noise: bool = False, soft_a=None):
         """
-        One reverse step. In wavelet space we default to no clamp.
-        x:   [B, 4, H/2, W/2]
-        cond:[B, 1, H/2, W/2]
+        One reverse step in coeff space. We bound x̂0 softly inside p_mean_variance;
+        no pixel clamp here.
         """
-        if clip_denoised is None:
-            # In coefficient space, pixel-range clamping [-1,1] is not appropriate.
-            clip_denoised = False
-
         b, _, h, w = x.shape
         device = x.device
 
-        # keep cond aligned
+        # align condition
+        c = None
         if self.with_condition:
             if condition_tensors is None:
                 raise ValueError("with_condition=True but condition_tensors is None")
-            if condition_tensors.shape[-2:] != (h, w):
-                condition_tensors = F.interpolate(condition_tensors, size=(h, w), mode='nearest')
-            condition_tensors = condition_tensors.to(device, non_blocking=True)
+            c = condition_tensors
+            if c.shape[-2:] != (h, w):
+                c = F.interpolate(c, size=(h, w), mode='nearest')
+            c = c.to(device, non_blocking=True)
 
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, c=condition_tensors, clip_denoised=clip_denoised
+            x=x, t=t, c=c, clip_denoised=clip_denoised, soft_a=soft_a
         )
 
-        noise = noise_like(x.shape, device, repeat_noise)
-        # no noise when t == 0
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (x.ndim - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+        # helpful debug (uses clamped c2 implicitly through model_mean)
+        if self.debug_p_sample:
+            c1_dbg = extract(self.posterior_mean_coef1, t, x.shape)
+            c2_dbg = extract(self.posterior_mean_coef2, t, x.shape).clamp(max=0.9995)
+            mm_from_xt = (c2_dbg * x).abs().mean().item()
+            print(f"[p_sample] t={int(t[0])} coef1={c1_dbg.mean().item():.6f} "
+                  f"coef2={c2_dbg.mean().item():.6f} |x_t|={x.abs().mean().item():.3e} "
+                  f"|mean|={model_mean.abs().mean().item():.3e} |c2*x_t|={mm_from_xt:.3e}")
 
+        noise = noise_like(x.shape, device, repeat_noise)
+        nonzero = (1 - (t == 0).float()).reshape(b, *((1,) * (x.ndim - 1)))
+        return model_mean + nonzero * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, condition_tensors=None, clip_denoised=None):
-        """
-        shape: (B, 4, H/2, W/2)  —  sampling directly in wavelet space
-        Returns: [B, 4, H/2, W/2] coefficients (do iDWT outside this function).
-        """
+    def p_sample_loop(self, shape, condition_tensors=None, clip_denoised: bool = False, soft_a=None):
+        """Return standardized coeffs of shape (B,4,H/2,W/2)."""
         device = self.betas.device
         b, _, h, w = shape
         img = torch.randn(shape, device=device)
 
-        if clip_denoised is None:
-            clip_denoised = False  # default for coeff space
-
-        # validate / align condition once up-front
-        cond = None
+        c = None
         if self.with_condition:
             if condition_tensors is None:
                 raise ValueError("with_condition=True but condition_tensors is None")
-            cond = condition_tensors
-            if cond.shape[-2:] != (h, w):
-                cond = F.interpolate(cond, size=(h, w), mode='nearest')
-            cond = cond.to(device, non_blocking=True)
+            c = condition_tensors
+            if c.shape[-2:] != (h, w):
+                c = F.interpolate(c, size=(h, w), mode='nearest')
+            c = c.to(device, non_blocking=True)
 
-        for i in tqdm(reversed(range(0, self.num_timesteps)),
-                    desc='sampling loop time step', total=self.num_timesteps):
+        for i in tqdm(reversed(range(self.num_timesteps)), total=self.num_timesteps, desc="Sampling"):
             t = torch.full((b,), i, device=device, dtype=torch.long)
-            img = self.p_sample(img, t, condition_tensors=cond, clip_denoised=clip_denoised)
+            img = self.p_sample(img, t, condition_tensors=c, clip_denoised=clip_denoised, soft_a=soft_a)
 
         return img
 
+    @torch.no_grad()
+    def sample(self, batch_size=2, condition_tensors=None):
+        return self.p_sample_loop(
+            (batch_size, self.channels, self.image_size, self.image_size),
+            condition_tensors=condition_tensors,
+            clip_denoised=False
+        )
 
     @torch.no_grad()
-    def sample(self, batch_size = 2, condition_tensors = None):
-        image_size = self.image_size
-        channels = self.channels
-        return self.p_sample_loop((batch_size, channels, image_size, image_size), condition_tensors = condition_tensors)
-
-    @torch.no_grad()
-    def interpolate(self, x1, x2, t = None, lam = 0.5):
+    def interpolate(self, x1, x2, t=None, lam=0.5):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
-
         assert x1.shape == x2.shape
-
         t_batched = torch.stack([torch.tensor(t, device=device)] * b)
         xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
-
         img = (1 - lam) * xt1 + lam * xt2
         for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
         return img
 
-    def q_sample(self, x_start, t, noise=None, c=None):
+    # -------------------- training --------------------
+    def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
-        x_hat = 0.
         return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise + x_hat
+            extract(self.sqrt_alphas_cumprod,            t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod,  t, x_start.shape) * noise
         )
 
     def p_losses(self, x_start, t, condition_tensors=None, noise=None):
         """
-        x_start: [B, 4, H/2, W/2]  (wavelet coeffs)
-        condition_tensors: [B, 1, H/2, W/2] (already downsampled by dataset)
+        x_start: standardized coeffs [B,4,H/2,W/2]
+        condition_tensors: [B,1,H/2,W/2] (already downsampled by dataset)
         """
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        # ensure cond matches spatial size (robust even if a mismatch slips in)
+        # align cond
         if self.with_condition:
             if condition_tensors is None:
                 raise ValueError("with_condition=True but condition_tensors is None")
             if condition_tensors.shape[-2:] != (h, w):
                 condition_tensors = F.interpolate(condition_tensors, size=(h, w), mode='nearest')
 
-        # diffuse target
+        # forward diffuse
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        # concat noisy target + condition (channel-wise)
-        if self.with_condition:
-            model_in = torch.cat([x_noisy, condition_tensors], dim=1)  # [B, 4+1, H/2, W/2]
-        else:
-            model_in = x_noisy
+        # predict eps
+        model_in = torch.cat([x_noisy, condition_tensors], dim=1) if self.with_condition else x_noisy
+        eps_pred = self.denoise_fn(model_in, t)
 
-        #x_recon = self.denoise_fn(model_in, t)  # expect out_channels == 4
-
-        # predict noise in wavelet space
-        x_recon = self.denoise_fn(model_in, t)  # [B,4,H/2,W/2]
-
-        # raw error per pixel
+        # base eps loss
         if self.loss_type == 'l1':
-            err = (x_recon - noise).abs()
+            # Huber (smooth-L1) is L1 in the tails, L2 near zero -> kills rare huge outliers
+            #err = (eps_pred - noise).abs()
+            err = F.smooth_l1_loss(eps_pred, noise, beta=1.0, reduction='none')
         elif self.loss_type == 'l2':
-            err = (x_recon - noise) ** 2
+            err = (eps_pred - noise) ** 2
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(f"Unknown loss_type: {self.loss_type}")
 
-        # optional band weighting: downweight LL, upweight HF
-        if hasattr(self, 'band_loss_weights_buf'):
-            w = self.band_loss_weights_buf.view(1, 4, 1, 1)
-            err = err * w
+        if self.band_loss_weights_buf is not None:
+            err = err * self.band_loss_weights_buf.view(1, 4, 1, 1)
 
         loss = err.mean()
+
+        # LL x0 auxiliary (for small t)
+        if self.ll_x0_aux_weight > 0:
+            x0_hat = self.predict_start_from_noise(x_noisy, t=t, noise=eps_pred)
+            #ll_err = (x0_hat[:, :1] - x_start[:, :1]).abs()  # L1 on LL only
+            #mask   = (t <= self.ll_aux_tmax).float().view(b, 1, 1, 1)
+            #ll_err_masked = (ll_err * mask).sum() / (mask.sum() + 1e-8)
+            aux_w    = getattr(self, "ll_x0_aux_weight", 0.0)
+            aux_tmax = getattr(self, "ll_aux_tmax", 0)
+            if aux_w > 0:
+                # reconstruct x0_hat from (x_t, t, ε_pred) in standardized space
+                x0_hat = self.predict_start_from_noise(x_noisy, t=t, noise=eps_pred)     # [B,4,H/2,W/2]
+                # per-sample LL error (L1) so we can mask by timestep
+                ll_err_per_sample = (x0_hat[:, :1] - x_start[:, :1]).abs().mean(dim=(1,2,3))  # [B]
+                mask_b = (t <= aux_tmax).float()                                         # [B]
+                denom  = mask_b.sum()
+                if denom > 0:
+                    ll_err_masked = (ll_err_per_sample * mask_b).sum() / denom
+                    loss = loss + aux_w * ll_err_masked
+
         return loss
 
-
-
     def forward(self, x, condition_tensors=None, *args, **kwargs):
-        b, c, h, w, device, img_size = *x.shape, x.device, self.image_size  # Removed depth_size
-        assert h == img_size and w == img_size, f'Expected dimensions: height={img_size}, width={img_size}. Actual: height={h}, width={w}.'
+        b, c, h, w = x.shape
+        img_size = self.image_size
+        assert h == img_size and w == img_size, f'Expected (H,W)=({img_size},{img_size}), got ({h},{w}).'
+        device = x.device
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         return self.p_losses(x, t, condition_tensors=condition_tensors, *args, **kwargs)
-
 
 # trainer class
 
