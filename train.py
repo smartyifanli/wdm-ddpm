@@ -1,7 +1,7 @@
 # train_wdm_2D.py (updated)
 # -*- coding:utf-8 -*-
 """
-WDM-style 2D training script (LL÷3, per-step pixel clamp in image space).
+WDM-style 2D training script (LLÃ·3, per-step pixel clamp in image space).
 Assumes your diffusion model implements the WDM clamp inside
 GaussianDiffusion.p_mean_variance(..., clip_denoised=True).
 Optionally supports x0-prediction if your GaussianDiffusion has `predict_x0`.
@@ -52,13 +52,13 @@ parser.add_argument('--images_dir', type=str, default="/storage/data/li46460_wdm
 parser.add_argument('--run_test_after_training', action='store_true')
 
 # Trainer / diffusion niceties
-parser.add_argument('--loss_type', type=str, default='l2', choices=['l1','l2'])
+parser.add_argument('--loss_type', type=str, default='l1', choices=['l1','l2'])
 parser.add_argument('--ema_decay', type=float, default=0.9999)
 parser.add_argument('--gradient_clip_val', type=float, default=1.0)
 parser.add_argument('--beta_schedule', type=str, default='cosine', choices=['linear','cosine'])
 parser.add_argument('--gradient_accumulate_every', type=int, default=2)
 parser.add_argument('--band_weights', type=str, default='1.0,1.0,1.0,1.0')
-parser.add_argument('--predict_x0', action='store_true', default=True, help='Use x0-prediction (wavelet MSE) if supported by diffusion class')
+parser.add_argument('--predict_x0', action='store_true', default=False, help='Use x0-prediction (wavelet MSE) if supported by diffusion class')
 
 args = parser.parse_args()
 
@@ -99,16 +99,16 @@ def ask_and_clear_dir(path, description):
                 import shutil
                 shutil.rmtree(path)
                 os.makedirs(path, exist_ok=True)
-                print(f"✅ Cleared {description}: {path}")
+                print(f"âœ… Cleared {description}: {path}")
                 break
             elif response in ['n', 'no']:
-                print(f"ℹ️ Keeping existing contents in {description}: {path}")
+                print(f"â„¹ï¸ Keeping existing contents in {description}: {path}")
                 break
             else:
                 print("Please enter 'y' or 'n'.")
     else:
         os.makedirs(path, exist_ok=True)
-        print(f"✅ Created empty {description}: {path}")
+        print(f"âœ… Created empty {description}: {path}")
 
 
 def _clip_flags(ds):
@@ -137,7 +137,7 @@ if WITH_COND:
     )
 
     # Debug first sample
-    print("\n🔍 DEBUGGING FIRST SAMPLE:")
+    print("\nðŸ” DEBUGGING FIRST SAMPLE:")
     if len(full_dataset) > 0:
         cond, coeffs = full_dataset[0]
         print(f"  Input (mask) shape: {cond.shape}  range=[{cond.min():.4f}, {cond.max():.4f}]  mean={cond.mean():.4f}  std={cond.std():.4f}")
@@ -163,7 +163,7 @@ if WITH_COND:
             'total_dataset_size': len(full_dataset),
             'test_size': len(test_dataset)
         }, f, indent=2)
-    print(f"✅ Test indices saved to: {indices_file}")
+    print(f"âœ… Test indices saved to: {indices_file}")
 
 else:
     # Unconditional path (kept for compatibility)
@@ -185,7 +185,7 @@ else:
             'total_dataset_size': len(full_dataset),
             'test_size': len(test_dataset)
         }, f, indent=2)
-    print(f"✅ Test indices saved to: {indices_file}")
+    print(f"âœ… Test indices saved to: {indices_file}")
 
 print(f"Total dataset size: {len(full_dataset)}")
 print(f"Train size: {len(train_dataset)}")
@@ -223,7 +223,7 @@ def init_weights(m):
 
 print("Applying manual weight initialization...")
 model.apply(init_weights)
-print("✅ Model weights initialized")
+print("âœ… Model weights initialized")
 
 # Diffusion wrapper (expects your GaussianDiffusion implements WDM clamp step)
 band_weights = [float(x) for x in args.band_weights.split(',')]
@@ -234,8 +234,7 @@ diffusion = GaussianDiffusion(
     loss_type=LOSS_TYPE,
     with_condition=WITH_COND,
     channels=out_channels,
-    predict_x0=args.predict_x0,
-    band_weights=band_weights
+    predict_x0=args.predict_x0
 ).cuda()
 
 # -----------------------------------------------------------------------------
@@ -266,17 +265,17 @@ def save_generation_organized(generated_img, original_dataset, test_index, data_
         import re
         m = re.search(r'(\d+)_(\d+)\.png$', ct_filename)
         if not m:
-            print(f"⚠️ Could not parse filename: {ct_filename}")
+            print(f"âš ï¸ Could not parse filename: {ct_filename}")
             return False
         subject_id, slice_id = m.group(1), m.group(2)
         out_dir = os.path.join(data_root, subject_id, 'positive', 'wdm_generation')
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{subject_id}_{slice_id}.png")
         save_image_png(generated_img, out_path)
-        print(f"✅ Saved: {subject_id}/positive/wdm_generation/{subject_id}_{slice_id}.png")
+        print(f"âœ… Saved: {subject_id}/positive/wdm_generation/{subject_id}_{slice_id}.png")
         return True
     except Exception as e:
-        print(f"❌ Error saving organized generation for index {test_index}: {e}")
+        print(f"âŒ Error saving organized generation for index {test_index}: {e}")
         return False
 
 
@@ -314,9 +313,7 @@ class CTTrainer(Trainer):
         plt.xlabel('Step'); plt.ylabel('Loss'); plt.title('Training Loss'); plt.grid(True, alpha=0.3)
         out = os.path.join(self.images_dir, 'loss_curve.png')
         plt.tight_layout(); plt.savefig(out, dpi=140); plt.close()
-        print(f"📊 Loss curve saved to: {out}")
-
-
+        print(f"ðŸ“Š Loss curve saved to: {out}")
 
     @torch.no_grad()
     def validate_and_save(self, milestone):
@@ -334,15 +331,6 @@ class CTTrainer(Trainer):
                 cond = cond.unsqueeze(0).cuda().float()        # [1,1,H/2,W/2]
                 target_coeffs = target_coeffs.unsqueeze(0).cuda().float()  # [1,4,H/2,W/2]
 
-                # ================================================================
-                # 🔍 DEBUG: Print target coefficient statistics
-                # ================================================================
-                print(f"\n🔍 Sample {i} ({subject_id}_{slice_id}) - TARGET coeffs (LL÷3):")
-                band_names = ['LL', 'LH', 'HL', 'HH']
-                for band_idx, band_name in enumerate(band_names):
-                    band_data = target_coeffs[0, band_idx]
-                    print(f"  {band_name}: mean={band_data.mean():.4f}, std={band_data.std():.4f}, range=[{band_data.min():.3f}, {band_data.max():.3f}]")
-
                 Hh = self.image_size
                 # WDM: force pixel clamp each step
                 gen_coeffs = self.ema_model.p_sample_loop(
@@ -351,30 +339,9 @@ class CTTrainer(Trainer):
                     clip_denoised=True,
                 )
 
-                # ================================================================
-                # 🔍 DEBUG: Print generated coefficient statistics
-                # ================================================================
-                print(f"📊 Sample {i} ({subject_id}_{slice_id}) - GENERATED coeffs (LL÷3):")
-                for band_idx, band_name in enumerate(band_names):
-                    gen_band = gen_coeffs[0, band_idx]
-                    tgt_band = target_coeffs[0, band_idx]
-                    mean_diff = gen_band.mean() - tgt_band.mean()
-                    std_ratio = gen_band.std() / (tgt_band.std() + 1e-8)
-                    print(f"  {band_name}: mean={gen_band.mean():.4f}, std={gen_band.std():.4f}, "
-                        f"mean_diff={mean_diff:.4f}, std_ratio={std_ratio:.3f}")
-                    
-
-                # For visualization: unscale LL (×3) before IDWT
+                # For visualization: unscale LL (Ã—3) before IDWT
                 gen_vis = gen_coeffs.clone(); gen_vis[:,0] *= 3.0
                 tgt_vis = target_coeffs.clone(); tgt_vis[:,0] *= 3.0
-
-                # ================================================================
-                # 🔍 DEBUG: Print image brightness after IDWT
-                # ================================================================
-                gen_img01 = (idwt_haar_1level(gen_vis).clamp(-1,1) + 1) * 0.5
-                tgt_img01 = (idwt_haar_1level(tgt_vis).clamp(-1,1) + 1) * 0.5
-                brightness_diff = gen_img01.mean() - tgt_img01.mean()
-                print(f"💡 Image brightness - Gen: {gen_img01.mean():.4f}, Tgt: {tgt_img01.mean():.4f}, Diff: {brightness_diff:.4f}")
 
                 # Mix A/B (be sure to unscale LL before IDWT)
                 mixA = gen_coeffs.clone();  mixA[:,1:] = target_coeffs[:,1:]
@@ -386,14 +353,6 @@ class CTTrainer(Trainer):
                 tgt_img01 = (idwt_haar_1level(tgt_vis).clamp(-1,1) + 1) * 0.5
                 mixA_img01 = (idwt_haar_1level(mixA_vis).clamp(-1,1) + 1) * 0.5
                 mixB_img01 = (idwt_haar_1level(mixB_vis).clamp(-1,1) + 1) * 0.5
-                # ================================================================
-                # 🔍 DEBUG: Print mix analysis
-                # ================================================================
-                mixA_brightness = mixA_img01.mean().item()
-                mixB_brightness = mixB_img01.mean().item()
-                tgt_brightness = tgt_img01.mean().item()
-                print(f"🔬 Mix analysis - MixA: {mixA_brightness:.4f}, MixB: {mixB_brightness:.4f}, "
-                    f"MixA_diff: {abs(mixA_brightness-tgt_brightness):.4f}, MixB_diff: {abs(mixB_brightness-tgt_brightness):.4f}")
 
                 subj_dir = os.path.join(step_dir, subject_id, 'positive', 'generation')
                 os.makedirs(subj_dir, exist_ok=True)
@@ -407,8 +366,6 @@ class CTTrainer(Trainer):
             except Exception as e:
                 print(f"Error generating validation sample {i}: {e}")
                 continue
-
-
 
     def train(self):
         from functools import partial
@@ -494,17 +451,17 @@ class WaveletDebugger:
         
     def debug_wdm_processing(self):
         """Debug WDM-specific coefficient processing"""
-        print("\n🔧 WDM PROCESSING ANALYSIS\n" + "-"*40)
+        print("\nðŸ”§ WDM PROCESSING ANALYSIS\n" + "-"*40)
         
         cond, coeffs = self.dataset[0]
         
         # Show dataset coeffs (LL already scaled)
-        self._coef_stats(coeffs, "dataset (LL÷3)")
+        self._coef_stats(coeffs, "dataset (LLÃ·3)")
         
         # Show what happens when we unscale for visualization
         coeffs_unscaled = coeffs.clone()
         coeffs_unscaled[0] = coeffs_unscaled[0] * 3.0
-        self._coef_stats(coeffs_unscaled, "unscaled for iDWT (LL×3)")
+        self._coef_stats(coeffs_unscaled, "unscaled for iDWT (LLÃ—3)")
         
         # Test the WDM clamp function
         test_coeffs = coeffs.unsqueeze(0).cuda()
@@ -519,7 +476,7 @@ class WaveletDebugger:
     
     def _backward_probe(self, coeffs, cond):
         """Debug the backward sampling process - where explosions typically occur"""
-        print(f"\n⏪ DIFFUSION BACKWARD PROCESS\n" + "-"*40)
+        print(f"\nâª DIFFUSION BACKWARD PROCESS\n" + "-"*40)
         
         B = 1
         x0 = coeffs.unsqueeze(0).cuda()      # [1,4,H/2,W/2] 
@@ -557,10 +514,10 @@ class WaveletDebugger:
                 
                 # Check for explosions
                 if x0_pred.abs().max() > 100:
-                    print(f"🚨 EXPLOSION DETECTED at t={tval}: max={x0_pred.abs().max():.1f}")
+                    print(f"ðŸš¨ EXPLOSION DETECTED at t={tval}: max={x0_pred.abs().max():.1f}")
                     self._analyze_explosion(x0_pred)
                 elif x0_pred.abs().max() > 10:
-                    print(f"⚠️  Large values at t={tval}: max={x0_pred.abs().max():.1f}")
+                    print(f"âš ï¸  Large values at t={tval}: max={x0_pred.abs().max():.1f}")
 
     def _analyze_explosion(self, x0_pred):
         """Analyze which bands are exploding"""
@@ -573,7 +530,7 @@ class WaveletDebugger:
 
     def debug_pipeline(self):
         # Your existing debug
-        print("\n🔍 COMPREHENSIVE WAVELET DEBUGGING\n" + "="*60)
+        print("\nðŸ” COMPREHENSIVE WAVELET DEBUGGING\n" + "="*60)
         cond, coeffs = (self.dataset[0] if not isinstance(self.dataset[0], dict)
                         else (self.dataset[0]['input'], self.dataset[0]['target']))
         print(f"Sample shapes: cond={cond.shape}, target_coeffs={coeffs.shape}")
@@ -584,14 +541,14 @@ class WaveletDebugger:
         
 
     def _coef_stats(self, coeffs, name):
-        print(f"\n📊 COEFFICIENT STATISTICS: {name}\n" + "-"*40)
+        print(f"\nðŸ“Š COEFFICIENT STATISTICS: {name}\n" + "-"*40)
         names = ['LL','LH','HL','HH']
         for i,nm in enumerate(names):
             b = coeffs[i].flatten()
-            print(f"{nm:2s}: range=[{b.min().item():7.3f},{b.max().item():7.3f}] μ={b.mean().item():7.3f} σ={b.std().item():7.3f} energy={(b.pow(2).mean().item()):7.3f}")
+            print(f"{nm:2s}: range=[{b.min().item():7.3f},{b.max().item():7.3f}] Î¼={b.mean().item():7.3f} Ïƒ={b.std().item():7.3f} energy={(b.pow(2).mean().item()):7.3f}")
 
     def _forward_probe(self, coeffs, cond):
-        print("\n⏩ DIFFUSION FORWARD PROCESS\n" + "-"*40)
+        print("\nâ© DIFFUSION FORWARD PROCESS\n" + "-"*40)
         B = 1
         x0 = coeffs.unsqueeze(0).cuda()
         c  = cond.unsqueeze(0).cuda()
@@ -602,19 +559,19 @@ class WaveletDebugger:
             print(f"t={tval:3d}: range=[{xt.min():8.3f},{xt.max():8.3f}] std={xt.std():6.3f} mean={xt.mean():7.3f}")
 
     def _recon_check(self, coeffs):
-        print("\n🔄 RECONSTRUCTION QUALITY TEST\n" + "-"*40)
+        print("\nðŸ”„ RECONSTRUCTION QUALITY TEST\n" + "-"*40)
         vis = coeffs.unsqueeze(0).clone(); vis[:,0] *= 3.0
         recon = idwt_haar_1level(vis)
         print(f"Reconstruction range: [{recon.min():.3f},{recon.max():.3f}]")
         out = (recon.clamp(-1,1) + 1)*0.5
         save_image(out, self.save_dir / "test_reconstruction.png")
-        print(f"✅ Test reconstruction saved to {self.save_dir / 'test_reconstruction.png'}")
+        print(f"âœ… Test reconstruction saved to {self.save_dir / 'test_reconstruction.png'}")
 
 
 def run_comprehensive_debug(dataset, model, diffusion):
     dbg = WaveletDebugger(dataset, model, diffusion)
     dbg.debug_pipeline()
-    print("\n📋 DEBUGGING COMPLETE! See:", dbg.save_dir)
+    print("\nðŸ“‹ DEBUGGING COMPLETE! See:", dbg.save_dir)
 
 # -----------------------------------------------------------------------------
 # Kick off training
@@ -649,7 +606,7 @@ def main():
     if len(RESUME) > 0 and os.path.exists(RESUME):
         if RESUME.endswith("ema_model_final.pth"):
             diffusion.load_state_dict(torch.load(RESUME))
-            print("✅ EMA model loaded for inference")
+            print("âœ… EMA model loaded for inference")
         else:
             ckpt = torch.load(RESUME, map_location='cuda')
             trainer.step = ckpt.get('step', 0)
@@ -657,8 +614,8 @@ def main():
             trainer.ema_model.load_state_dict(ckpt['ema'])
             if 'optimizer' in ckpt:
                 trainer.opt.load_state_dict(ckpt['optimizer'])
-                print("✅ Optimizer state loaded")
-            print(f"✅ Training resumed from step {trainer.step}")
+                print("âœ… Optimizer state loaded")
+            print(f"âœ… Training resumed from step {trainer.step}")
 
     # Train
     trainer.train()
@@ -666,7 +623,7 @@ def main():
     # Save EMA
     ema_ckpt = os.path.join(TEST_DIR, 'ema_model_final.pth')
     torch.save(trainer.ema_model.state_dict(), ema_ckpt)
-    print(f"✅ EMA weights saved to {ema_ckpt}")
+    print(f"âœ… EMA weights saved to {ema_ckpt}")
 
     # Post-train debug with EMA-UNet
     unet_ema = trainer.ema_model.denoise_fn
@@ -674,10 +631,10 @@ def main():
 
     # Optional test sweep
     if RUN_TEST:
-        print("\n🧪 RUNNING TEST EVALUATION...")
+        print("\nðŸ§ª RUNNING TEST EVALUATION...")
         test_model_wavelet(trainer.ema_model, test_dataset, TEST_DIR, full_dataset, DATA_ROOT, WITH_COND)
     else:
-        print("\n💡 To run test evaluation later, pass --run_test_after_training")
+        print("\nðŸ’¡ To run test evaluation later, pass --run_test_after_training")
         print("   Test indices:", os.path.join(IMAGES_DIR, 'test_indices.json'))
 
 
@@ -719,8 +676,8 @@ def test_model_wavelet(ema_model, test_dataset, out_dir, full_dataset, data_root
             save_image(img01, os.path.join(subj_gen_dir, f"{subject_id}_{slice_id}.png"))
             saved += 1
         except Exception as e:
-            print(f"❌ Test sample {i} failed: {e}")
-    print(f"✅ Saved {saved} generations to subject folders.")
+            print(f"âŒ Test sample {i} failed: {e}")
+    print(f"âœ… Saved {saved} generations to subject folders.")
 
 
 if __name__ == "__main__":
