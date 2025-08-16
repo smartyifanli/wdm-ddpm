@@ -1,4 +1,3 @@
-
 # trainer_2D.py
 #-*- coding:utf-8 -*-
 #
@@ -102,8 +101,8 @@ def cosine_beta_schedule(timesteps, s=0.008):
 class GaussianDiffusion(nn.Module):
     """
     Diffusion in wavelet-coefficient space (2D, C=4 bands).
-    - Dataset supplies wavelet coeffs with LL already ÷3
-    - Optional ε-prediction (default) or x₀-prediction (toggle `predict_x0`)
+    - Dataset supplies wavelet coeffs with LL already Ã·3
+    - Optional Îµ-prediction (default) or xâ‚€-prediction (toggle `predict_x0`)
     - Per-step pixel-space clamp (clip_denoised=True) for stability
     """
 
@@ -122,7 +121,6 @@ class GaussianDiffusion(nn.Module):
         with_pairwised=False,
         apply_bce=False,
         lambda_bce=0.0,
-        band_weights=None
     ):
         super().__init__()
         self.channels       = channels
@@ -132,13 +130,6 @@ class GaussianDiffusion(nn.Module):
         self.loss_type      = loss_type
         self.predict_x0     = bool(predict_x0)
         self.debug_p_sample = False
-        if band_weights is not None:
-            bw = torch.as_tensor(band_weights, dtype=torch.float32)
-            if bw.numel() != 4:
-                raise ValueError("band_weights must have 4 values for [LL,LH,HL,HH].")
-            self.register_buffer('band_weights', bw / bw.sum())
-        else:
-            self.band_weights = None
 
         # schedule
         betas = (betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas)
@@ -149,7 +140,7 @@ class GaussianDiffusion(nn.Module):
 
         self.num_timesteps = int(betas.shape[0])
         to_t = partial(torch.tensor, dtype=torch.float32)
-        self.register_buffer('_dummy', torch.zeros(1))  # for device access
+
         self.register_buffer('betas',                         to_t(betas))
         self.register_buffer('alphas_cumprod',                to_t(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev',           to_t(alphas_cumprod_prev))
@@ -177,16 +168,6 @@ class GaussianDiffusion(nn.Module):
 
     # ---------- forward / posterior math ----------
 
-        # ---- correlated noise: N(0,1) in image space -> DWT -> LL÷3 format ----
-    def _make_wavelet_noise(self, x_like: torch.Tensor) -> torch.Tensor:
-        # x_like: [B,4,Hh,Wh] in LL÷3 format
-        B, _, Hh, Wh = x_like.shape
-        device = x_like.device
-        noise_img = torch.randn(B, 1, Hh*2, Wh*2, device=device)
-        w = dwt_haar_1level_batched(noise_img)   # [B,4,Hh,Wh]
-        w[:, :1] = w[:, :1] / 3.0                # keep LL in ÷3 convention
-        return w
-
     def q_mean_variance(self, x_start: torch.Tensor, t: torch.LongTensor):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
         var  = extract(1. - self.alphas_cumprod, t, x_start.shape)
@@ -212,13 +193,13 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def process_xstart_wdm(self, x0_coeffs: torch.Tensor) -> torch.Tensor:
         """
-        Coeffs -> (LL×3) -> IDWT -> clamp [-1,1] -> DWT -> (LL÷3), all batched.
+        Coeffs -> (LLÃ—3) -> IDWT -> clamp [-1,1] -> DWT -> (LLÃ·3), all batched.
         """
         x0_unscaled = x0_coeffs.clone()
-        x0_unscaled[:, :1] = x0_unscaled[:, :1] * 3.0     # LL ×3
+        x0_unscaled[:, :1] = x0_unscaled[:, :1] * 3.0     # LL Ã—3
         img = idwt_haar_1level(x0_unscaled).clamp_(-1.0, 1.0)
         w  = dwt_haar_1level_batched(img)
-        w[:, :1] = w[:, :1] / 3.0                         # LL ÷3
+        w[:, :1] = w[:, :1] / 3.0                         # LL Ã·3
         return w
 
     # ---------- reverse step ----------
@@ -228,7 +209,7 @@ class GaussianDiffusion(nn.Module):
         """
         One reverse step in wavelet space.
         - If predict_x0: model outputs x0 directly
-        - Else: model outputs ε, we reconstruct x0
+        - Else: model outputs Îµ, we reconstruct x0
         - Optional per-step pixel-space clamp (clip_denoised=True)
         """
         # prepare model input
@@ -239,7 +220,7 @@ class GaussianDiffusion(nn.Module):
 
         # predict x0 or eps
         if self.predict_x0:
-            x0_hat = self.denoise_fn(model_in, t)                 # wavelet coeffs, LL already ÷3
+            x0_hat = self.denoise_fn(model_in, t)                 # wavelet coeffs, LL already Ã·3
         else:
             eps = self.denoise_fn(model_in, t)
             x0_hat = self.predict_start_from_noise(x, t=t, noise=eps)
@@ -326,7 +307,7 @@ class GaussianDiffusion(nn.Module):
     # ---------- training ----------
 
     def q_sample(self, x_start, t, noise=None):
-        noise = noise if noise is not None else self._make_wavelet_noise(x_start)
+        noise = noise if noise is not None else torch.randn_like(x_start)
         return (
             extract(self.sqrt_alphas_cumprod,           t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
@@ -334,12 +315,11 @@ class GaussianDiffusion(nn.Module):
 
     def p_losses(self, x_start, t, condition_tensors=None, noise=None):
         """
-        x_start: wavelet coeffs [B,4,H/2,W/2] from dataset (LL already ÷3)
+        x_start: wavelet coeffs [B,4,H/2,W/2] from dataset (LL already Ã·3)
         condition_tensors: [B,1,H/2,W/2]
         """
         b, c, h, w = x_start.shape
-        if noise is None:
-            noise = self._make_wavelet_noise(x_start)
+        noise = noise if noise is not None else torch.randn_like(x_start)
 
         # align cond
         if self.with_condition:
@@ -353,33 +333,17 @@ class GaussianDiffusion(nn.Module):
         model_in = torch.cat([x_noisy, condition_tensors], dim=1) if self.with_condition else x_noisy
 
         if self.predict_x0:
-            # x0-prediction (WDM-style). Target is x_start (LL already ÷3)
+            # x0-prediction (WDM-style). Target is x_start (LL already Ã·3)
             x0_pred = self.denoise_fn(model_in, t)
             if self.loss_type == 'l2':
-                #loss = (x0_pred - x_start).pow(2).mean()
-                if self.band_weights is None:
-                    loss = (x0_pred - x_start).pow(2).mean()
-                else:
-                    per = []
-                    for band in range(4):
-                        per.append(((x0_pred[:,band:band+1]-x_start[:,band:band+1])**2).mean() * self.band_weights[band])
-                    loss = sum(per)
+                loss = (x0_pred - x_start).pow(2).mean()
             elif self.loss_type == 'l1':
-                #loss = F.smooth_l1_loss(x0_pred, x_start, beta=1.0, reduction='mean')
-                if self.band_weights is None:
-                    loss = F.smooth_l1_loss(x0_pred, x_start, beta=1.0, reduction='mean')
-                else:
-                    per = []
-                    for band in range(4):
-                        band_loss = F.smooth_l1_loss(x0_pred[:,band:band+1], x_start[:,band:band+1], beta=1.0, reduction='mean')
-                        per.append(band_loss * self.band_weights[band])
-                    loss = sum(per)
+                loss = F.smooth_l1_loss(x0_pred, x_start, beta=1.0, reduction='mean')
             else:
                 raise NotImplementedError(self.loss_type)
         else:
-            # ε-prediction (classic DDPM)
+            # Îµ-prediction (classic DDPM)
             eps_pred = self.denoise_fn(model_in, t)
-            #noise = noise if noise is not None else self._make_wavelet_noise(x_start)
             if self.loss_type == 'l2':
                 loss = (eps_pred - noise).pow(2).mean()
             elif self.loss_type == 'l1':
@@ -502,7 +466,7 @@ class Trainer(object):
         coeffs = self.ema_model.p_sample_loop(
             shape=(batch_size, 4, Hh, Hh),
             condition_tensors=cond,
-            clip_denoised=True
+            clip_denoised=False
         )
 
         if de_standardize and (mu is not None) and (std is not None):
